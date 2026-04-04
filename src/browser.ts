@@ -259,6 +259,7 @@ export async function captureWithContext(browser: Browser, url: string, opts: Bc
 
     // Network output
     if (tracker) {
+      await tracker.flush();
       if (opts.network) process.stderr.write(tracker.formatSummary(opts.networkFilter, opts.networkErrors));
       if (opts.waterfall) process.stderr.write(tracker.formatWaterfall(opts.networkFilter));
       if (opts.har) tracker.saveHAR(opts.har);

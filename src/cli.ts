@@ -3,7 +3,7 @@
 import { Command, Option } from 'commander';
 import { join, dirname } from 'path';
 import { mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
-import { BcurlOptions, DEVICES } from './types.js';
+import { BcurlOptions, CaptureResult, DEVICES } from './types.js';
 import { launchAndCapture, launchAndCaptureParallel } from './browser.js';
 import { formatWriteOut, outputResult, printHeaders } from './output.js';
 import { loadConfig, isConfigDisabled, getExplicitConfig } from './config.js';
@@ -199,6 +199,12 @@ function buildProgram(): Command {
     .option('-K, --config <file>', 'Read config from file')
     .option('-q, --disable', 'Disable automatic config file loading');
 
+  // --- Retry options ---
+  program
+    .option('--retry <num>', 'Retry on transient failures (default 0)', parseInt)
+    .option('--retry-delay <seconds>', 'Wait between retries (default 1)', parseFloat)
+    .option('--retry-max-time <seconds>', 'Maximum total time for retries', parseFloat);
+
   // --- Replay option ---
   program
     .option('--replay <file>', 'Replay recorded interactions before capture');
@@ -392,6 +398,9 @@ async function main(): Promise<void> {
     formLogin: rawOpts.formLogin,
     formField: rawOpts.formField,
     formSubmit: rawOpts.formSubmit,
+    retry: rawOpts.retry,
+    retryDelay: rawOpts.retryDelay,
+    retryMaxTime: rawOpts.retryMaxTime,
     network: rawOpts.network,
     har: rawOpts.har,
     networkFilter: rawOpts.networkFilter,
@@ -432,9 +441,7 @@ async function main(): Promise<void> {
 
     try {
       const startTime = Date.now();
-      const result = useDaemon
-        ? await captureViaDaemon(url, opts)
-        : await launchAndCapture(url, opts);
+      const result = await captureWithRetry(url, opts, useDaemon);
       const elapsed = Date.now() - startTime;
 
       if (opts.verbose && !opts.silent) {
@@ -476,10 +483,53 @@ async function main(): Promise<void> {
         }));
       }
     } catch (err: any) {
-      if (!opts.silent || opts.showError) error(`Failed to capture ${url}: ${err.message}`);
+      if (!opts.silent || opts.showError) {
+        const msg = formatError(err);
+        error(`Failed to capture ${url}: ${msg}`);
+      }
       process.exit(1);
     }
   }
+}
+
+async function captureWithRetry(
+  url: string, opts: BcurlOptions, useDaemon: boolean
+): Promise<CaptureResult> {
+  const maxRetries = opts.retry ?? 0;
+  const retryDelay = (opts.retryDelay ?? 1) * 1000;
+  const retryMaxTime = opts.retryMaxTime ? opts.retryMaxTime * 1000 : Infinity;
+  const retryStart = Date.now();
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (useDaemon) {
+        try {
+          return await captureViaDaemon(url, opts);
+        } catch (daemonErr: any) {
+          // Daemon failed — fall back to standalone with a warning
+          if (!opts.silent) {
+            process.stderr.write(`bcurl: daemon error, falling back to standalone: ${daemonErr.message}\n`);
+          }
+          return await launchAndCapture(url, opts);
+        }
+      }
+      return await launchAndCapture(url, opts);
+    } catch (err: any) {
+      const elapsed = Date.now() - retryStart;
+      if (attempt < maxRetries && elapsed < retryMaxTime) {
+        if (!opts.silent) {
+          process.stderr.write(
+            `bcurl: attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}\n`
+            + `bcurl: retrying in ${retryDelay / 1000}s...\n`
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Unreachable');
 }
 
 async function handleParallel(opts: BcurlOptions, remoteName: boolean): Promise<void> {
@@ -553,6 +603,30 @@ function formatHeaderText(status?: number, headers?: Record<string, string>): st
 
 function log(msg: string): void { process.stderr.write(msg + '\n'); }
 function error(msg: string): void { process.stderr.write(`bcurl: ${msg}\n`); }
+
+function formatError(err: any): string {
+  const msg: string = err.message ?? String(err);
+
+  // Playwright-specific error messages → human-friendly
+  if (msg.includes('net::ERR_NAME_NOT_RESOLVED'))
+    return `DNS lookup failed — could not resolve hostname`;
+  if (msg.includes('net::ERR_CONNECTION_REFUSED'))
+    return `Connection refused — is the server running?`;
+  if (msg.includes('net::ERR_CONNECTION_TIMED_OUT'))
+    return `Connection timed out`;
+  if (msg.includes('net::ERR_CERT_'))
+    return `SSL certificate error (use -k to ignore): ${msg}`;
+  if (msg.includes('Timeout') && msg.includes('exceeded'))
+    return `Page load timeout exceeded (use -m to increase)`;
+  if (msg.includes('Cannot connect to daemon'))
+    return `Daemon connection failed — try --daemon-stop && --daemon, or use --no-daemon`;
+  if (msg.includes('not found on page'))
+    return msg; // Selector not found — already clear
+  if (msg.includes('Replay failed'))
+    return msg; // Replay error — already clear
+
+  return msg;
+}
 
 main().catch((err) => {
   process.stderr.write(`bcurl: ${err.message}\n`);

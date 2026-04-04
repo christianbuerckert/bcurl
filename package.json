@@ -11,9 +11,17 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "npx playwright install chromium"
   },
-  "keywords": ["curl", "screenshot", "browser", "headless", "cli"],
+  "keywords": [
+    "curl",
+    "screenshot",
+    "browser",
+    "headless",
+    "cli"
+  ],
   "license": "MIT",
   "dependencies": {
     "commander": "^13.1.0",
@@ -21,6 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.2"
   }
 }

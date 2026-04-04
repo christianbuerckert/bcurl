@@ -19,6 +19,7 @@ export interface NetworkEntry {
 export class NetworkTracker {
   private entries: NetworkEntry[] = [];
   private pending = new Map<string, { request: Request; startTime: number }>();
+  private responsePromises: Promise<void>[] = [];
   private pageStartTime = 0;
 
   attach(page: Page): void {
@@ -31,38 +32,9 @@ export class NetworkTracker {
       });
     });
 
-    page.on('response', async (response: Response) => {
-      const request = response.request();
-      const key = request.url() + request.method();
-      const pendingEntry = this.pending.get(key);
-      const startTime = pendingEntry?.startTime ?? 0;
-      const endTime = Date.now() - this.pageStartTime;
-
-      let size = 0;
-      try {
-        const body = await response.body();
-        size = body.length;
-      } catch {
-        // body not available
-        const contentLength = response.headers()['content-length'];
-        if (contentLength) size = parseInt(contentLength, 10);
-      }
-
-      this.entries.push({
-        url: request.url(),
-        method: request.method(),
-        resourceType: request.resourceType(),
-        status: response.status(),
-        statusText: response.statusText(),
-        contentType: response.headers()['content-type'] ?? '',
-        size,
-        startTime,
-        endTime,
-        duration: endTime - startTime,
-        failed: response.status() >= 400,
-      });
-
-      this.pending.delete(key);
+    page.on('response', (response: Response) => {
+      const p = this.handleResponse(response);
+      this.responsePromises.push(p);
     });
 
     page.on('requestfailed', (request: Request) => {
@@ -88,6 +60,45 @@ export class NetworkTracker {
 
       this.pending.delete(key);
     });
+  }
+
+  private async handleResponse(response: Response): Promise<void> {
+    const request = response.request();
+    const key = request.url() + request.method();
+    const pendingEntry = this.pending.get(key);
+    const startTime = pendingEntry?.startTime ?? 0;
+    const endTime = Date.now() - this.pageStartTime;
+
+    let size = 0;
+    try {
+      const body = await response.body();
+      size = body.length;
+    } catch {
+      const contentLength = response.headers()['content-length'];
+      if (contentLength) size = parseInt(contentLength, 10);
+    }
+
+    this.entries.push({
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      status: response.status(),
+      statusText: response.statusText(),
+      contentType: response.headers()['content-type'] ?? '',
+      size,
+      startTime,
+      endTime,
+      duration: endTime - startTime,
+      failed: response.status() >= 400,
+    });
+
+    this.pending.delete(key);
+  }
+
+  /** Wait for all async response handlers to complete. */
+  async flush(): Promise<void> {
+    await Promise.all(this.responsePromises);
+    this.responsePromises = [];
   }
 
   getEntries(filter?: string, errorsOnly?: boolean): NetworkEntry[] {

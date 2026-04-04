@@ -102,6 +102,11 @@ export interface BcurlOptions {
   config?: string;
   disable?: boolean;
 
+  // --- Retry ---
+  retry?: number;
+  retryDelay?: number;
+  retryMaxTime?: number;
+
   // --- Replay ---
   replay?: string;
 

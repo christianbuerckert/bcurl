@@ -116,6 +116,10 @@ bcurl --format pdf -o page.pdf https://example.com
 %{time_starttransfer} — Time to first byte
 %{size_download}      — Screenshot size in bytes
 %{filename_effective} — Output filename
+%{num_requests}       — Total number of network requests made
+%{size_total}         — Total bytes transferred (all requests)
+%{time_dom_loaded}    — Time until DOMContentLoaded event (seconds)
+%{time_page_loaded}   — Time until load event (seconds)
 ```
 
 **Example:** `bcurl -s -w '%{http_code} %{time_total}s %{size_download}B\n' -o f.png url`
@@ -201,6 +205,177 @@ bcurl --form-login ... --save-session prod.json -o x.png https://app/dashboard
 bcurl --load-session prod.json -o y.png https://app/other-page
 ```
 
+### Daemon Mode
+
+Keep a background browser running for near-instant captures. The daemon maintains
+a pool of pre-warmed browser contexts so subsequent `bcurl` calls skip browser
+startup entirely.
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `--daemon` | — | Start background browser daemon (or use with URL to auto-start) |
+| `--daemon-stop` | — | Stop the running daemon |
+| `--daemon-status` | — | Check if daemon is running |
+| `--no-daemon` | — | Force standalone mode (skip daemon even if running) |
+| `--pool-size` | `<n>` | Browser context pool size for daemon (default: 3) |
+| `--idle-timeout` | `<seconds>` | Auto-shutdown daemon after idle period (default: 300) |
+
+When a daemon is running, all `bcurl` commands automatically route through it
+unless `--no-daemon` is specified.
+
+**Typical workflow:**
+
+```bash
+# Start the daemon
+bcurl --daemon
+
+# All subsequent captures are fast (no browser startup)
+bcurl -o page1.png https://example.com
+bcurl -o page2.png https://example.org
+
+# Check status
+bcurl --daemon-status
+
+# Stop when done
+bcurl --daemon-stop
+```
+
+**Custom pool and timeout:**
+
+```bash
+# Large pool, 10-minute idle timeout
+bcurl --daemon --pool-size 8 --idle-timeout 600
+```
+
+### Network Analysis
+
+Inspect network requests made during page load. Useful for debugging performance,
+finding broken resources, or exporting HAR files for analysis tools.
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `--network` | — | Show network request summary on stderr |
+| `--har` | `<file>` | Save HAR (HTTP Archive) file |
+| `--network-filter` | `<glob>` | Filter network output by URL pattern |
+| `--network-errors` | — | Show only failed network requests |
+| `--waterfall` | — | Show ASCII timing waterfall of network requests |
+
+**Examples:**
+
+```bash
+# Show all network requests
+bcurl --network -o page.png https://example.com
+
+# Save HAR file for Chrome DevTools / har-analyzer
+bcurl --har requests.har -o page.png https://example.com
+
+# Show only errors (4xx/5xx, timeouts, blocked)
+bcurl --network-errors -o page.png https://example.com
+
+# Filter to API calls only
+bcurl --network --network-filter '*/api/*' -o page.png https://example.com
+
+# ASCII waterfall timing chart
+bcurl --waterfall -o page.png https://example.com
+```
+
+**Example `--waterfall` output:**
+
+```
+GET https://example.com/            200   245ms ████████████
+GET /style.css                      200    82ms   ████
+GET /app.js                         200   153ms   ████████
+GET /api/data                       200   301ms     ████████████████
+GET /logo.png                       200    45ms   ██
+GET /fonts/inter.woff2              200    67ms    ███
+                                                0ms       150ms      300ms
+```
+
+### Parallel Capture
+
+Capture multiple URLs concurrently for faster batch operations.
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `-Z, --parallel` | — | Capture multiple URLs in parallel |
+| `--parallel-max` | `<num>` | Maximum parallel captures (default: 4) |
+| `--progress` | — | Show progress for parallel captures |
+
+**Example:**
+
+```bash
+# Capture 5 sites in parallel, max 3 at a time
+bcurl -Z --parallel-max 3 --progress -O \
+  https://example.com \
+  https://example.org \
+  https://example.net \
+  https://example.edu \
+  https://example.io
+```
+
+**Example `--progress` output:**
+
+```
+Capturing 5 URLs (max 3 parallel)...
+[1/5] ✓ example.com → example.com.png (1.2s)
+[2/5] ✓ example.org → example.org.png (1.5s)
+[3/5] ✗ example.net — Error: net::ERR_NAME_NOT_RESOLVED
+[4/5] ✓ example.edu → example.edu.png (2.1s)
+[5/5] ✓ example.io → example.io.png (0.9s)
+
+Done: 4 succeeded, 1 failed in 3.2s
+```
+
+### Config Files
+
+bcurl supports config files using the same format as curl's `.curlrc`. Default
+options are loaded automatically from config files, and CLI arguments always
+override config values.
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `-K, --config` | `<file>` | Read config from file (always loaded, even with `-q`) |
+| `-q, --disable` | — | Disable automatic config file loading |
+
+**Config file search order (all are loaded, later values override):**
+
+1. `/etc/bcurlrc`
+2. `~/.bcurlrc`
+3. `./.bcurlrc` (current directory)
+
+**Config file format:**
+
+```
+# ~/.bcurlrc — default options for bcurl
+# Lines starting with # are comments
+
+# Boolean flags (no value needed)
+silent
+full-page
+
+# Key-value pairs (space or = separator)
+window-size 1920x1080
+format = png
+quality 90
+
+# Quoted values for strings with spaces
+header "Accept-Language: de-DE"
+user-agent "My Custom Agent/1.0"
+
+# Device emulation
+device iphone-14
+```
+
+**Usage:**
+
+```bash
+# Use a project-specific config
+bcurl -K ./project.bcurlrc -o page.png https://example.com
+
+# Ignore all config files (use only CLI flags)
+bcurl -q -o page.png https://example.com
+```
+
 ### Form Login (Multi-Step Authentication)
 
 For pages that require login before capture:
@@ -231,6 +406,120 @@ The tool will:
 2. Fill each `--form-field` using `page.fill(selector, value)`
 3. Click `--form-submit` and wait for navigation / SPA route change
 4. Navigate to the target URL and take the screenshot
+
+### Visual Diff
+
+Compare two screenshots or a screenshot against a live URL to detect visual
+regressions. The `diff` subcommand produces a diff image highlighting changed
+pixels in magenta and reports match/mismatch statistics.
+
+**Usage:**
+
+```bash
+bcurl diff <image1|url1> <image2|url2> [options]
+```
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `-o, --output` | `<file>` | Save diff image to file (otherwise written to stdout) |
+| `--threshold` | `<percent>` | Allowed diff percentage before reporting mismatch (default: 0) |
+| `--reference` | `<file>` | Baseline image to compare against a single URL or file |
+| `--stats` | — | Print diff statistics to stderr (enabled by default) |
+
+Inputs can be local image files or URLs. When a URL is given, bcurl captures a
+fresh screenshot before comparing.
+
+**Compare two files:**
+
+```bash
+bcurl diff before.png after.png -o diff.png
+```
+
+**Compare a baseline against a live site:**
+
+```bash
+bcurl diff --reference baseline.png https://example.com -o diff.png
+```
+
+**CI regression check with threshold:**
+
+```bash
+# Fail (exit 1) if more than 0.5% of pixels changed
+bcurl diff --threshold 0.5 --reference golden.png https://staging.example.com
+```
+
+**Example output:**
+
+```
+Pixels changed: 1284 / 2073600
+Diff: 0.06%
+Match: YES (threshold: 0.5%)
+Diff image saved to diff.png
+```
+
+### Record & Replay
+
+Record interactive browser sessions and replay them before taking screenshots.
+This is useful for capturing pages that require multi-step interactions beyond
+simple form login.
+
+**Record interactions:**
+
+```bash
+bcurl record -o flow.json <url>
+```
+
+This opens a visible browser window. Interact with the page normally (click,
+type, navigate). When you close the browser window (or press Ctrl+C), the
+recording is saved.
+
+**Replay before capture:**
+
+```bash
+bcurl --replay flow.json -o result.png <url>
+```
+
+| Flag | Argument | Description |
+|------|----------|-------------|
+| `--replay` | `<file>` | Replay recorded interactions before capture |
+
+**Recording JSON format:**
+
+```json
+{
+  "version": 1,
+  "startUrl": "https://app.example.com/login",
+  "recordedAt": "2026-04-04T10:30:00.000Z",
+  "steps": [
+    { "action": "goto", "url": "https://app.example.com/login" },
+    { "action": "fill", "selector": "#username", "value": "admin" },
+    { "action": "fill", "selector": "#password", "value": "secret" },
+    { "action": "click", "selector": "button[type=\"submit\"]" },
+    { "action": "waitForNavigation" },
+    { "action": "click", "selector": "#menu-reports" },
+    { "action": "waitForNavigation" }
+  ]
+}
+```
+
+Supported step actions: `goto`, `fill`, `click`, `select`, `check`, `uncheck`,
+`hover`, `press`, `type`, `scroll`, `wait`, `waitForSelector`,
+`waitForNavigation`, `evaluate`.
+
+**Example workflow:**
+
+```bash
+# Step 1: Record a login + navigation flow
+bcurl record -o login-flow.json https://app.example.com/login
+
+# Step 2: Replay flow, then capture the final page state
+bcurl --replay login-flow.json -o dashboard.png https://app.example.com
+
+# Step 3: Combine with session to avoid re-recording
+bcurl --replay login-flow.json --save-session session.json \
+  -o dashboard.png https://app.example.com
+bcurl --load-session session.json -o settings.png https://app.example.com/settings
+```
 
 ---
 
@@ -299,6 +588,44 @@ bcurl -x http://proxy.corp:8080 -U user:pass -o page.png https://internal.app
 
 ```bash
 bcurl --output-dir ./screenshots --create-dirs -O \
+  https://example.com https://example.org https://example.net
+```
+
+### Fast Captures with Daemon
+
+```bash
+bcurl --daemon
+bcurl -o page1.png https://example.com    # ~200ms instead of ~2s
+bcurl -o page2.png https://example.org
+bcurl --daemon-stop
+```
+
+### Visual Regression in CI
+
+```bash
+bcurl diff --threshold 0.1 --reference golden/home.png \
+  https://staging.example.com -o diffs/home-diff.png
+```
+
+### Network Performance Audit
+
+```bash
+bcurl --waterfall --network-errors -w '%{time_dom_loaded}s DOMContentLoaded, %{time_page_loaded}s loaded, %{num_requests} requests\n' \
+  -o page.png https://example.com
+```
+
+### Record Login, Replay for Capture
+
+```bash
+bcurl record -o login.json https://app.example.com/login
+bcurl --replay login.json -o report.png https://app.example.com/reports
+```
+
+### Parallel Screenshots with Config File
+
+```bash
+# Use project config for consistent settings
+bcurl -K project.bcurlrc -Z --progress -O \
   https://example.com https://example.org https://example.net
 ```
 
