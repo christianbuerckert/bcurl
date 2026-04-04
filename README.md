@@ -190,7 +190,14 @@ html({ selector: "table.data" })        → "<table>..."
 - Node.js >= 18
 - npm
 
-### Install System-Wide
+### Homebrew
+
+```bash
+brew tap christianbuerckert/bcurl https://github.com/christianbuerckert/bcurl
+brew install bcurl
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/christianbuerckert/bcurl.git
@@ -207,7 +214,8 @@ BCURL_INSTALL_DIR=$HOME/.local ./install.sh
 ### Uninstall
 
 ```bash
-./uninstall.sh
+brew uninstall bcurl        # if installed via Homebrew
+./uninstall.sh              # if installed from source
 ```
 
 ## Documentation
