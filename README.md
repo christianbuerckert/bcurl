@@ -23,6 +23,16 @@ bcurl --device iphone-14 -o mobile.png https://example.com
 bcurl --full-page --format pdf -o page.pdf https://example.com
 ```
 
+## Use with Claude Code
+
+Register bcurl as an MCP server — gives Claude 20 browser tools (navigate, click, fill, screenshot, html, text, ...):
+
+```bash
+claude mcp add bcurl -- bcurl --mcp
+```
+
+Claude can then browse the web interactively, log into apps, read page content, and take screenshots.
+
 ## Features
 
 ### Curl-Compatible Flags
