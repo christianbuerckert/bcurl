@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
 import { Command, Option } from 'commander';
-import { resolve, join, dirname, basename, extname } from 'path';
+import { join, dirname } from 'path';
 import { mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
 import { BcurlOptions, DEVICES } from './types.js';
-import { launchAndCapture } from './browser.js';
+import { launchAndCapture, launchAndCaptureParallel } from './browser.js';
 import { formatWriteOut, outputResult, printHeaders } from './output.js';
+import { loadConfig, isConfigDisabled, getExplicitConfig } from './config.js';
+import { isDaemonRunning, getDaemonStatus, stopDaemon, captureViaDaemon, spawnDaemon } from './daemon.js';
+import { handleDiff } from './diff.js';
+import { recordInteractions } from './record.js';
 
 const VERSION = '1.0.0';
 
@@ -43,14 +47,36 @@ function buildProgram(): Command {
       + '  bcurl -v -w \'%{http_code} %{time_total}s\\n\' URL   Verbose + stats\n'
       + '\n'
       + 'Form Login + Session:\n'
-      + '  bcurl --form-login URL                             Login before capture\n'
-      + '    --form-field \'input[name="user"]=admin\'          Fill form field\n'
-      + '    --form-field \'input[type="password"]=secret\'     Fill password\n'
-      + '    --form-submit \'button:text-is("Login")\'          Submit form\n'
-      + '    --session session.json                           Save session for reuse\n'
+      + '  bcurl --form-login URL \\                           Login before capture\n'
+      + '    --form-field \'input[name="user"]=admin\' \\        Fill form field\n'
+      + '    --form-field \'input[type="password"]=secret\' \\   Fill password\n'
+      + '    --form-submit \'button:text-is("Login")\' \\        Submit form\n'
+      + '    --session session.json \\                          Save session for reuse\n'
       + '    -o dashboard.png https://app/dashboard\n'
-      + '\n'
       + '  bcurl --session session.json -o dash.png URL       Reuse saved session\n'
+      + '\n'
+      + 'Network Analysis:\n'
+      + '  bcurl --network URL                                Show all network requests\n'
+      + '  bcurl --waterfall URL                              ASCII timing waterfall\n'
+      + '  bcurl --har requests.har URL                       Save HAR file\n'
+      + '\n'
+      + 'Parallel Capture:\n'
+      + '  bcurl -Z -O url1 url2 url3                         Capture URLs in parallel\n'
+      + '\n'
+      + 'Visual Diff:\n'
+      + '  bcurl diff old.png new.png -o diff.png             Compare two screenshots\n'
+      + '  bcurl diff --reference base.png URL -o diff.png    Compare URL vs baseline\n'
+      + '\n'
+      + 'Record & Replay:\n'
+      + '  bcurl record -o flow.json URL                      Record browser interactions\n'
+      + '  bcurl --replay flow.json -o page.png URL           Replay then capture\n'
+      + '\n'
+      + 'Daemon (fast mode):\n'
+      + '  bcurl --daemon                                     Start background browser\n'
+      + '  bcurl -o fast.png URL                              Auto-uses daemon if running\n'
+      + '  bcurl --daemon-stop                                Stop daemon\n'
+      + '\n'
+      + 'Config: ~/.bcurlrc (same format as .curlrc)\n'
       + '\n'
       + 'Devices: iphone-12, iphone-14, iphone-14-pro-max, pixel-7,\n'
       + '         ipad, ipad-pro, galaxy-s23, desktop-hd, desktop-4k, macbook-pro-16\n'
@@ -145,6 +171,38 @@ function buildProgram(): Command {
     .option('--form-field <selector=value>', 'Fill form field: CSS_SELECTOR=value (repeatable)', collect, [])
     .option('--form-submit <selector>', 'Click this element to submit the login form');
 
+  // --- Daemon options ---
+  program
+    .option('--daemon', 'Start background browser daemon for fast captures')
+    .option('--daemon-stop', 'Stop the running daemon')
+    .option('--daemon-status', 'Check if daemon is running')
+    .option('--no-daemon', 'Force standalone mode (skip daemon even if running)')
+    .option('--pool-size <n>', 'Browser context pool size for daemon (default 3)', parseInt)
+    .option('--idle-timeout <seconds>', 'Daemon auto-shutdown after idle (default 300)', parseInt);
+
+  // --- Network options ---
+  program
+    .option('--network', 'Show network request summary on stderr')
+    .option('--har <file>', 'Save HAR (HTTP Archive) file')
+    .option('--network-filter <glob>', 'Filter network output by URL pattern')
+    .option('--network-errors', 'Show only failed network requests')
+    .option('--waterfall', 'Show ASCII timing waterfall of network requests');
+
+  // --- Parallel options ---
+  program
+    .option('-Z, --parallel', 'Capture multiple URLs in parallel')
+    .option('--parallel-max <num>', 'Maximum parallel captures (default 4)', parseInt)
+    .option('--progress', 'Show progress for parallel captures');
+
+  // --- Config options ---
+  program
+    .option('-K, --config <file>', 'Read config from file')
+    .option('-q, --disable', 'Disable automatic config file loading');
+
+  // --- Replay option ---
+  program
+    .option('--replay <file>', 'Replay recorded interactions before capture');
+
   return program;
 }
 
@@ -174,20 +232,98 @@ function parseHeaders(headerStrings: string[]): Record<string, string> {
   for (const h of headerStrings) {
     const colonIdx = h.indexOf(':');
     if (colonIdx > 0) {
-      const key = h.substring(0, colonIdx).trim();
-      const value = h.substring(colonIdx + 1).trim();
-      headers[key] = value;
+      headers[h.substring(0, colonIdx).trim()] = h.substring(colonIdx + 1).trim();
     }
   }
   return headers;
 }
 
 async function main(): Promise<void> {
+  // Load config files before parsing
+  const rawArgv = process.argv.slice(2);
+  const disabled = isConfigDisabled(rawArgv);
+  const explicitConfig = getExplicitConfig(rawArgv);
+
+  let configArgs: string[] = [];
+  try {
+    configArgs = loadConfig(explicitConfig, disabled);
+  } catch (err: any) {
+    process.stderr.write(`bcurl: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  // Prepend config args (CLI args override config)
+  const fullArgv = ['node', 'bcurl', ...configArgs, ...rawArgv];
+
+  // Check for subcommands before parsing
+  const subcommand = rawArgv[0];
+
+  if (subcommand === 'diff') {
+    const diffArgs = rawArgv.slice(1);
+    const diffOpts: any = {};
+    const inputs: string[] = [];
+    for (let i = 0; i < diffArgs.length; i++) {
+      const arg = diffArgs[i];
+      if (arg === '-o' || arg === '--output') { diffOpts.output = diffArgs[++i]; }
+      else if (arg === '--threshold') { diffOpts.threshold = diffArgs[++i]; }
+      else if (arg === '--reference') { diffOpts.reference = diffArgs[++i]; }
+      else if (arg === '--stats') { diffOpts.stats = true; }
+      else if (arg === '--window-size') { diffOpts.windowSize = diffArgs[++i]; }
+      else if (arg === '--device') { diffOpts.device = diffArgs[++i]; }
+      else if (arg === '--session') { diffOpts.session = diffArgs[++i]; }
+      else if (!arg.startsWith('-')) { inputs.push(arg); }
+    }
+    await handleDiff(inputs, diffOpts);
+    return;
+  }
+
+  if (subcommand === 'record') {
+    const recordArgs = rawArgv.slice(1);
+    let outputFile = '';
+    let startUrl = '';
+    let windowSize: string | undefined;
+    for (let i = 0; i < recordArgs.length; i++) {
+      const arg = recordArgs[i];
+      if (arg === '-o' || arg === '--output') { outputFile = recordArgs[++i]; }
+      else if (arg === '--window-size') { windowSize = recordArgs[++i]; }
+      else if (!arg.startsWith('-')) { startUrl = arg; }
+    }
+    if (!startUrl || !outputFile) {
+      process.stderr.write('Usage: bcurl record -o <output.json> <url>\n');
+      process.exit(1);
+    }
+    startUrl = normalizeUrl(startUrl);
+    await recordInteractions(startUrl, outputFile, windowSize);
+    return;
+  }
+
   const program = buildProgram();
-  program.parse(process.argv);
+  program.parse(fullArgv);
 
   const rawOpts = program.opts();
   const urls = program.args;
+
+  // --- Handle daemon commands ---
+  if (rawOpts.daemonStatus) {
+    const status = getDaemonStatus();
+    if (status.running) {
+      console.log(`bcurl daemon running (pid ${status.pid})`);
+    } else {
+      console.log('bcurl daemon not running');
+    }
+    return;
+  }
+
+  if (rawOpts.daemonStop) {
+    const stopped = await stopDaemon();
+    console.log(stopped ? 'bcurl daemon stopped' : 'bcurl daemon not running');
+    return;
+  }
+
+  if (rawOpts.daemon && urls.length === 0) {
+    spawnDaemon(rawOpts.poolSize, rawOpts.idleTimeout);
+    return;
+  }
 
   if (urls.length === 0) {
     program.help();
@@ -256,145 +392,167 @@ async function main(): Promise<void> {
     formLogin: rawOpts.formLogin,
     formField: rawOpts.formField,
     formSubmit: rawOpts.formSubmit,
+    network: rawOpts.network,
+    har: rawOpts.har,
+    networkFilter: rawOpts.networkFilter,
+    networkErrors: rawOpts.networkErrors,
+    waterfall: rawOpts.waterfall,
+    parallel: rawOpts.parallel,
+    parallelMax: rawOpts.parallelMax,
+    progress: rawOpts.progress,
+    replay: rawOpts.replay,
+    noDaemon: rawOpts.noDaemon ?? rawOpts.daemon === false,
   };
 
   // Validate device
   if (opts.device && !DEVICES[opts.device]) {
-    const available = Object.keys(DEVICES).join(', ');
-    error(`Unknown device: ${opts.device}. Available: ${available}`);
+    error(`Unknown device: ${opts.device}. Available: ${Object.keys(DEVICES).join(', ')}`);
     process.exit(1);
   }
 
-  // Handle --remote-name
   const remoteName: boolean = rawOpts.remoteName;
+  const useDaemon = !opts.noDaemon && isDaemonRunning();
 
+  // --- Parallel mode ---
+  if (opts.parallel && opts.urls.length > 1) {
+    await handleParallel(opts, remoteName);
+    return;
+  }
+
+  // --- Sequential mode ---
   for (let i = 0; i < opts.urls.length; i++) {
     const url = opts.urls[i];
 
-    if (!opts.silent) {
-      if (opts.verbose) {
-        log(`> Navigating to ${url}`);
-        if (opts.windowSize) log(`> Viewport: ${opts.windowSize}`);
-        if (opts.device) log(`> Device emulation: ${opts.device}`);
-        if (opts.proxy) log(`> Using proxy: ${opts.proxy}`);
-        if (opts.insecure) log(`> SSL verification disabled`);
-      }
+    if (!opts.silent && opts.verbose) {
+      log(`> Navigating to ${url}`);
+      if (opts.windowSize) log(`> Viewport: ${opts.windowSize}`);
+      if (opts.device) log(`> Device emulation: ${opts.device}`);
+      if (useDaemon) log(`> Using daemon`);
     }
 
     try {
       const startTime = Date.now();
-      const result = await launchAndCapture(url, opts);
+      const result = useDaemon
+        ? await captureViaDaemon(url, opts)
+        : await launchAndCapture(url, opts);
       const elapsed = Date.now() - startTime;
 
       if (opts.verbose && !opts.silent) {
         log(`< HTTP ${result.status}`);
         if (result.headers) {
-          for (const [k, v] of Object.entries(result.headers)) {
-            log(`< ${k}: ${v}`);
-          }
+          for (const [k, v] of Object.entries(result.headers)) log(`< ${k}: ${v}`);
         }
         log(`< Screenshot: ${result.buffer.length} bytes (${result.format})`);
         log(`< Total time: ${(elapsed / 1000).toFixed(3)}s`);
       }
 
-      // -I/--head: print headers only
-      if (opts.head) {
-        printHeaders(result.status, result.headers);
-        continue;
-      }
+      if (opts.head) { printHeaders(result.status, result.headers); continue; }
+      if (opts.include) printHeaders(result.status, result.headers);
 
-      // -i/--include: print headers before image
-      if (opts.include) {
-        printHeaders(result.status, result.headers);
-      }
-
-      // -D/--dump-header
       if (opts.dumpHeader) {
         const headerText = formatHeaderText(result.status, result.headers);
-        const dumpPath = opts.dumpHeader === '-' ? '/dev/stdout' : opts.dumpHeader;
-        if (dumpPath === '/dev/stdout') {
-          process.stdout.write(headerText);
-        } else {
-          writeFileSync(dumpPath, headerText);
-        }
+        if (opts.dumpHeader === '-') process.stdout.write(headerText);
+        else writeFileSync(opts.dumpHeader, headerText);
       }
 
-      // Determine output file path
-      let outputPath: string | undefined = opts.output;
-      if (remoteName && !outputPath) {
-        outputPath = deriveFilename(url, result.format);
-      }
-      if (outputPath && opts.outputDir) {
-        outputPath = join(opts.outputDir, outputPath);
-      } else if (!outputPath && opts.outputDir) {
-        outputPath = join(opts.outputDir, deriveFilename(url, result.format));
-      }
+      let outputPath = resolveOutputPath(opts, url, result.format, remoteName, i);
 
-      // For multiple URLs without explicit output, generate names
-      if (opts.urls.length > 1 && !outputPath) {
-        outputPath = deriveFilename(url, result.format);
-        if (opts.outputDir) {
-          outputPath = join(opts.outputDir, outputPath);
-        }
-      }
-
-      // Create directories if needed
       if (outputPath && opts.createDirs) {
         const dir = dirname(outputPath);
-        if (!existsSync(dir)) {
-          mkdirSync(dir, { recursive: true });
-        }
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       }
 
       await outputResult(result, outputPath, opts);
 
-      // -w/--write-out
       if (opts.writeOut) {
-        const writeOutStr = formatWriteOut(opts.writeOut, {
-          url,
-          status: result.status ?? 0,
-          contentType: `image/${result.format}`,
+        process.stderr.write(formatWriteOut(opts.writeOut, {
+          url, status: result.status ?? 0, contentType: `image/${result.format}`,
           timeTotal: elapsed / 1000,
           timeDns: (result.timing?.dns ?? 0) / 1000,
           timeConnect: (result.timing?.connect ?? 0) / 1000,
           timeTtfb: (result.timing?.ttfb ?? 0) / 1000,
           sizeDownload: result.buffer.length,
           filename: outputPath ?? '<stdout>',
-        });
-        process.stderr.write(writeOutStr);
-      }
-
-      // Save cookies
-      if (opts.cookieJar) {
-        // Cookies are handled inside browser.ts and saved there
+        }));
       }
     } catch (err: any) {
-      if (!opts.silent || opts.showError) {
-        error(`Failed to capture ${url}: ${err.message}`);
-      }
+      if (!opts.silent || opts.showError) error(`Failed to capture ${url}: ${err.message}`);
       process.exit(1);
     }
   }
 }
 
+async function handleParallel(opts: BcurlOptions, remoteName: boolean): Promise<void> {
+  const maxConc = opts.parallelMax ?? 4;
+  const total = opts.urls.length;
+  let succeeded = 0;
+  let failed = 0;
+  const globalStart = Date.now();
+
+  if (!opts.silent) log(`Capturing ${total} URLs (max ${maxConc} parallel)...`);
+
+  for await (const { url, result, error: err, index } of launchAndCaptureParallel(opts.urls, opts, maxConc)) {
+    const num = succeeded + failed + 1;
+
+    if (err) {
+      failed++;
+      if (opts.progress || !opts.silent) {
+        process.stderr.write(`[${num}/${total}] \u2717 ${new URL(url).hostname} \u2014 Error: ${err}\n`);
+      }
+      continue;
+    }
+
+    succeeded++;
+    const outputPath = resolveOutputPath(opts, url, result!.format, remoteName || true, index);
+
+    if (outputPath) {
+      if (opts.createDirs) {
+        const dir = dirname(outputPath);
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      }
+      writeFileSync(outputPath, result!.buffer);
+
+      if (opts.progress || !opts.silent) {
+        const elapsed = (result!.timing?.total ?? 0) / 1000;
+        process.stderr.write(
+          `[${num}/${total}] \u2713 ${new URL(url).hostname} \u2192 ${outputPath} (${elapsed.toFixed(1)}s)\n`
+        );
+      }
+    }
+  }
+
+  const totalTime = ((Date.now() - globalStart) / 1000).toFixed(1);
+  if (!opts.silent) {
+    log(`\nDone: ${succeeded} succeeded, ${failed} failed in ${totalTime}s`);
+  }
+
+  if (failed > 0) process.exit(1);
+}
+
+function resolveOutputPath(
+  opts: BcurlOptions, url: string, format: string, remoteName: boolean, index: number
+): string | undefined {
+  let outputPath: string | undefined = opts.output;
+  if (remoteName && !outputPath) outputPath = deriveFilename(url, format);
+  if (outputPath && opts.outputDir) outputPath = join(opts.outputDir, outputPath);
+  else if (!outputPath && opts.outputDir) outputPath = join(opts.outputDir, deriveFilename(url, format));
+  if (opts.urls.length > 1 && !outputPath) {
+    outputPath = deriveFilename(url, format);
+    if (opts.outputDir) outputPath = join(opts.outputDir, outputPath);
+  }
+  return outputPath;
+}
+
 function formatHeaderText(status?: number, headers?: Record<string, string>): string {
   let text = `HTTP/1.1 ${status ?? 0}\r\n`;
   if (headers) {
-    for (const [k, v] of Object.entries(headers)) {
-      text += `${k}: ${v}\r\n`;
-    }
+    for (const [k, v] of Object.entries(headers)) text += `${k}: ${v}\r\n`;
   }
-  text += '\r\n';
-  return text;
+  return text + '\r\n';
 }
 
-function log(msg: string): void {
-  process.stderr.write(msg + '\n');
-}
-
-function error(msg: string): void {
-  process.stderr.write(`bcurl: ${msg}\n`);
-}
+function log(msg: string): void { process.stderr.write(msg + '\n'); }
+function error(msg: string): void { process.stderr.write(`bcurl: ${msg}\n`); }
 
 main().catch((err) => {
   process.stderr.write(`bcurl: ${err.message}\n`);

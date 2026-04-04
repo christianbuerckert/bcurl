@@ -79,6 +79,71 @@ bcurl --session session.json -o dashboard.png https://app.example.com/dashboard
 
 The session file stores cookies and localStorage (including JWT tokens, auth state). Subsequent calls skip the login entirely.
 
+### Daemon Mode (Fast Captures)
+
+Keep Chromium running in the background — subsequent captures skip the ~1.5s browser startup:
+
+```bash
+bcurl --daemon                              # Start daemon
+bcurl -o page.png https://example.com       # Auto-uses daemon (fast!)
+bcurl --daemon-status                       # Check daemon
+bcurl --daemon-stop                         # Stop daemon
+```
+
+### Network Analysis
+
+Inspect every request the browser makes:
+
+```bash
+bcurl --network URL                         # Request summary table
+bcurl --waterfall URL                       # ASCII timing waterfall
+bcurl --har requests.har URL                # Export HAR file
+bcurl --network --network-errors URL        # Show only failures
+```
+
+### Parallel Capture
+
+Capture multiple URLs simultaneously:
+
+```bash
+bcurl -Z -O url1 url2 url3 url4            # Parallel with auto-filenames
+bcurl -Z --parallel-max 8 --progress -O url1 url2 ...
+```
+
+### Visual Diff
+
+Compare screenshots pixel-by-pixel:
+
+```bash
+bcurl diff old.png new.png -o diff.png      # Compare two files
+bcurl diff --reference base.png URL         # Compare URL vs baseline
+bcurl diff url1 url2 -o diff.png            # Compare two URLs
+```
+
+Exit code 0 = match, 1 = difference. Use `--threshold 0.5` for tolerance.
+
+### Record & Replay
+
+Record complex interactions (multi-step flows, dropdowns, etc.) and replay them:
+
+```bash
+bcurl record -o login-flow.json URL         # Opens visible browser, records clicks/input
+bcurl --replay login-flow.json -o page.png URL   # Replay before capture
+```
+
+### Config File (~/.bcurlrc)
+
+Set defaults in `~/.bcurlrc` (same format as curl's `.curlrc`):
+
+```
+window-size 1920x1080
+format png
+silent
+header "Accept-Language: de-DE"
+```
+
+Config is loaded from `/etc/bcurlrc`, `~/.bcurlrc`, `./.bcurlrc`. Override with `-K file`, disable with `-q`.
+
 ## Installation
 
 ### Requirements

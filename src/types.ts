@@ -78,6 +78,33 @@ export interface BcurlOptions {
   formField?: string[];
   formSubmit?: string;
 
+  // --- Daemon ---
+  daemon?: boolean;
+  daemonStop?: boolean;
+  daemonStatus?: boolean;
+  noDaemon?: boolean;
+  poolSize?: number;
+  idleTimeout?: number;
+
+  // --- Network ---
+  network?: boolean;
+  har?: string;
+  networkFilter?: string;
+  networkErrors?: boolean;
+  waterfall?: boolean;
+
+  // --- Parallel ---
+  parallel?: boolean;
+  parallelMax?: number;
+  progress?: boolean;
+
+  // --- Config ---
+  config?: string;
+  disable?: boolean;
+
+  // --- Replay ---
+  replay?: string;
+
   // --- Internal ---
   urls: string[];
 }

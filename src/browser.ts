@@ -1,6 +1,8 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Route } from 'playwright';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { BcurlOptions, CaptureResult, DEVICES } from './types.js';
+import { NetworkTracker } from './network.js';
+import { replaySteps, type RecordingStep } from './record.js';
 
 interface PageTiming {
   dns?: number;
@@ -25,19 +27,10 @@ function parseGeolocation(geo?: string): { latitude: number; longitude: number }
 }
 
 function buildPostData(opts: BcurlOptions): { body?: string; contentType?: string } {
-  // --json takes priority
   if (opts.json && opts.json.length > 0) {
-    return {
-      body: opts.json.join(''),
-      contentType: 'application/json',
-    };
+    return { body: opts.json.join(''), contentType: 'application/json' };
   }
-
-  const allData: string[] = [
-    ...(opts.data ?? []),
-    ...(opts.dataRaw ?? []),
-  ];
-
+  const allData: string[] = [...(opts.data ?? []), ...(opts.dataRaw ?? [])];
   if (opts.dataUrlencode && opts.dataUrlencode.length > 0) {
     const encoded = opts.dataUrlencode.map((d) => {
       if (d.includes('=')) {
@@ -48,93 +41,68 @@ function buildPostData(opts: BcurlOptions): { body?: string; contentType?: strin
     });
     allData.push(...encoded);
   }
-
   if (allData.length > 0) {
-    return {
-      body: allData.join('&'),
-      contentType: 'application/x-www-form-urlencoded',
-    };
+    return { body: allData.join('&'), contentType: 'application/x-www-form-urlencoded' };
   }
-
   return {};
 }
 
-export async function launchAndCapture(url: string, opts: BcurlOptions): Promise<CaptureResult> {
-  const startTime = Date.now();
+function buildContextOpts(opts: BcurlOptions): Parameters<Browser['newContext']>[0] {
+  const device = opts.device ? DEVICES[opts.device] : undefined;
+  const viewport = parseViewport(opts.windowSize) ?? device?.viewport ?? { width: 1280, height: 720 };
 
-  // --- Build browser launch options ---
-  const launchOpts: Parameters<typeof chromium.launch>[0] = {
-    headless: true,
-  };
-
-  if (opts.proxy) {
-    const proxyUrl = opts.proxy.includes('://') ? opts.proxy : `http://${opts.proxy}`;
-    launchOpts.proxy = {
-      server: proxyUrl,
-      username: opts.proxyUser?.split(':')[0],
-      password: opts.proxyUser?.split(':').slice(1).join(':'),
-    };
+  const sessionLoadPath = opts.loadSession ?? (opts.session && existsSync(opts.session) ? opts.session : undefined);
+  let storageState: string | undefined;
+  if (sessionLoadPath && existsSync(sessionLoadPath)) {
+    storageState = sessionLoadPath;
   }
 
-  const browser: Browser = await chromium.launch(launchOpts);
+  const contextOpts: Parameters<Browser['newContext']>[0] = {
+    viewport,
+    ignoreHTTPSErrors: opts.insecure ?? false,
+    userAgent: opts.userAgent ?? device?.userAgent,
+    deviceScaleFactor: device?.deviceScaleFactor ?? 1,
+    isMobile: device?.isMobile ?? false,
+    hasTouch: device?.hasTouch ?? false,
+    javaScriptEnabled: opts.noJavascript ? false : true,
+    locale: opts.locale,
+    timezoneId: opts.timezone,
+    colorScheme: opts.darkMode ? 'dark' : undefined,
+    geolocation: parseGeolocation(opts.geolocation),
+    permissions: opts.geolocation ? ['geolocation'] : undefined,
+    storageState,
+  };
+
+  const extraHeaders: Record<string, string> = { ...(opts.extraHttpHeaders ?? {}) };
+  if (opts.referer) extraHeaders['Referer'] = opts.referer;
+  if (opts.user) {
+    extraHeaders['Authorization'] = `Basic ${Buffer.from(opts.user).toString('base64')}`;
+  }
+  if (opts.oauth2Bearer) {
+    extraHeaders['Authorization'] = `Bearer ${opts.oauth2Bearer}`;
+  }
+  if (Object.keys(extraHeaders).length > 0) {
+    contextOpts.extraHTTPHeaders = extraHeaders;
+  }
+
+  return contextOpts;
+}
+
+/**
+ * Core capture logic — works with an existing browser (for daemon) or standalone.
+ */
+export async function captureWithContext(browser: Browser, url: string, opts: BcurlOptions): Promise<CaptureResult> {
+  const startTime = Date.now();
+  const contextOpts = buildContextOpts(opts);
+  const context: BrowserContext = await browser.newContext(contextOpts);
 
   try {
-    // --- Build context options ---
-    const device = opts.device ? DEVICES[opts.device] : undefined;
-    const viewport = parseViewport(opts.windowSize)
-      ?? device?.viewport
-      ?? { width: 1280, height: 720 };
-
-    // Load session state (--session or --load-session)
-    const sessionLoadPath = opts.loadSession ?? (opts.session && existsSync(opts.session) ? opts.session : undefined);
-    let storageState: string | undefined;
-    if (sessionLoadPath && existsSync(sessionLoadPath)) {
-      storageState = sessionLoadPath;
-    }
-
-    const contextOpts: Parameters<Browser['newContext']>[0] = {
-      viewport,
-      ignoreHTTPSErrors: opts.insecure ?? false,
-      userAgent: opts.userAgent ?? device?.userAgent,
-      deviceScaleFactor: device?.deviceScaleFactor ?? 1,
-      isMobile: device?.isMobile ?? false,
-      hasTouch: device?.hasTouch ?? false,
-      javaScriptEnabled: opts.noJavascript ? false : true,
-      locale: opts.locale,
-      timezoneId: opts.timezone,
-      colorScheme: opts.darkMode ? 'dark' : undefined,
-      geolocation: parseGeolocation(opts.geolocation),
-      permissions: opts.geolocation ? ['geolocation'] : undefined,
-      storageState,
-    };
-
-    // Extra HTTP headers (from -H flags + auth + referer)
-    const extraHeaders: Record<string, string> = { ...(opts.extraHttpHeaders ?? {}) };
-    if (opts.referer) {
-      extraHeaders['Referer'] = opts.referer;
-    }
-    if (opts.user) {
-      const encoded = Buffer.from(opts.user).toString('base64');
-      extraHeaders['Authorization'] = `Basic ${encoded}`;
-    }
-    if (opts.oauth2Bearer) {
-      extraHeaders['Authorization'] = `Bearer ${opts.oauth2Bearer}`;
-    }
-    if (Object.keys(extraHeaders).length > 0) {
-      contextOpts.extraHTTPHeaders = extraHeaders;
-    }
-
-    const context: BrowserContext = await browser.newContext(contextOpts);
-
-    // Set cookies from -b flag
+    // Set cookies
     if (opts.cookie && opts.cookie.length > 0) {
       const cookies = parseCookieStrings(opts.cookie, url);
-      if (cookies.length > 0) {
-        await context.addCookies(cookies);
-      }
+      if (cookies.length > 0) await context.addCookies(cookies);
     }
 
-    // Emulate media type
     const page: Page = await context.newPage();
 
     if (opts.emulateMedia) {
@@ -144,24 +112,35 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
       await page.emulateMedia({ colorScheme: 'dark' });
     }
 
-    // Block images if requested
+    // Block images
     if (opts.blockImages || opts.noImages) {
       await page.route('**/*', (route: Route) => {
-        if (route.request().resourceType() === 'image') {
-          return route.abort();
-        }
+        if (route.request().resourceType() === 'image') return route.abort();
         return route.continue();
       });
     }
 
-    // --- Form Login (pre-step) ---
+    // Network tracking
+    let tracker: NetworkTracker | undefined;
+    if (opts.network || opts.har || opts.waterfall) {
+      tracker = new NetworkTracker();
+      tracker.attach(page);
+    }
+
     const timeout = opts.maxTime ? opts.maxTime * 1000 : 30000;
 
+    // --- Replay (pre-step) ---
+    if (opts.replay) {
+      const recording = JSON.parse(readFileSync(opts.replay, 'utf-8'));
+      const steps: RecordingStep[] = recording.steps ?? recording;
+      await replaySteps(page, steps, timeout);
+    }
+
+    // --- Form Login (pre-step) ---
     if (opts.formLogin) {
       const loginUrl = opts.formLogin.includes('://') ? opts.formLogin : `https://${opts.formLogin}`;
       await page.goto(loginUrl, { waitUntil: 'networkidle', timeout });
 
-      // Fill form fields
       if (opts.formField && opts.formField.length > 0) {
         for (const field of opts.formField) {
           const { selector, value } = parseFormField(field);
@@ -169,20 +148,15 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
         }
       }
 
-      // Submit the form
       if (opts.formSubmit) {
         const currentUrl = page.url();
         await page.click(opts.formSubmit);
-
-        // Wait for either a real navigation or SPA route change
         try {
           await Promise.race([
             page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10000 }),
-            page.waitForURL((url) => url.toString() !== currentUrl, { timeout: 10000 }),
+            page.waitForURL((u) => u.toString() !== currentUrl, { timeout: 10000 }),
           ]);
-        } catch {
-          // SPA may not trigger navigation — wait for network to settle
-        }
+        } catch {}
         await page.waitForLoadState('networkidle').catch(() => {});
         await page.waitForTimeout(500);
       }
@@ -192,33 +166,22 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
     let responseStatus: number | undefined;
     let responseHeaders: Record<string, string> | undefined;
 
-    // Handle POST data - intercept the first request to add POST body
     const postData = buildPostData(opts);
-    const method = opts.request?.toUpperCase()
-      ?? (postData.body ? 'POST' : 'GET');
+    const method = opts.request?.toUpperCase() ?? (postData.body ? 'POST' : 'GET');
 
     if (method !== 'GET' || postData.body) {
-      // Intercept the navigation request to modify method/body
       await page.route(url, async (route) => {
         const headers: Record<string, string> = {};
-        if (postData.contentType) {
-          headers['Content-Type'] = postData.contentType;
-        }
+        if (postData.contentType) headers['Content-Type'] = postData.contentType;
         await route.continue({
           method,
           postData: postData.body,
-          headers: {
-            ...route.request().headers(),
-            ...headers,
-          },
+          headers: { ...route.request().headers(), ...headers },
         });
       });
     }
 
-    const response = await page.goto(url, {
-      waitUntil: 'networkidle',
-      timeout,
-    });
+    const response = await page.goto(url, { waitUntil: 'networkidle', timeout });
 
     responseStatus = response?.status();
     responseHeaders = {};
@@ -230,30 +193,14 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
     }
 
     // --- Post-load actions ---
+    if (opts.waitFor) await page.waitForSelector(opts.waitFor, { timeout });
+    if (opts.wait && opts.wait > 0) await page.waitForTimeout(opts.wait);
+    if (opts.javascript) await page.evaluate(opts.javascript);
 
-    // Wait for selector to appear
-    if (opts.waitFor) {
-      await page.waitForSelector(opts.waitFor, { timeout });
-    }
-
-    // Wait fixed time
-    if (opts.wait && opts.wait > 0) {
-      await page.waitForTimeout(opts.wait);
-    }
-
-    // Execute custom JavaScript
-    if (opts.javascript) {
-      await page.evaluate(opts.javascript);
-    }
-
-    // Click elements
     if (opts.click && opts.click.length > 0) {
-      for (const sel of opts.click) {
-        await page.click(sel);
-      }
+      for (const sel of opts.click) await page.click(sel);
     }
 
-    // Scroll to element
     if (opts.scrollTo) {
       await page.evaluate((sel: string) => {
         const el = document.querySelector(sel);
@@ -262,7 +209,6 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
       await page.waitForTimeout(300);
     }
 
-    // Hide elements
     if (opts.hide && opts.hide.length > 0) {
       for (const sel of opts.hide) {
         await page.evaluate((s: string) => {
@@ -278,15 +224,10 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
     let buffer: Buffer;
 
     if (format === 'pdf') {
-      buffer = await page.pdf({
-        format: 'A4',
-        printBackground: true,
-      });
+      buffer = await page.pdf({ format: 'A4', printBackground: true });
     } else if (opts.selector) {
       const element = await page.$(opts.selector);
-      if (!element) {
-        throw new Error(`Selector "${opts.selector}" not found on page`);
-      }
+      if (!element) throw new Error(`Selector "${opts.selector}" not found on page`);
       buffer = await element.screenshot({
         type: format as 'png' | 'jpeg',
         quality: format === 'jpeg' ? (opts.quality ?? 80) : undefined,
@@ -299,7 +240,7 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
       }) as Buffer;
     }
 
-    // Collect timing
+    // Timing
     const timing: PageTiming = { total: Date.now() - startTime };
     try {
       const perfTiming = await page.evaluate(() => {
@@ -313,18 +254,17 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
           loaded: perf.loadEventEnd - perf.startTime,
         };
       });
-      if (perfTiming) {
-        timing.dns = perfTiming.dns;
-        timing.connect = perfTiming.connect;
-        timing.ttfb = perfTiming.ttfb;
-        timing.domLoaded = perfTiming.domLoaded;
-        timing.loaded = perfTiming.loaded;
-      }
-    } catch {
-      // Timing not available
+      if (perfTiming) Object.assign(timing, perfTiming);
+    } catch {}
+
+    // Network output
+    if (tracker) {
+      if (opts.network) process.stderr.write(tracker.formatSummary(opts.networkFilter, opts.networkErrors));
+      if (opts.waterfall) process.stderr.write(tracker.formatWaterfall(opts.networkFilter));
+      if (opts.har) tracker.saveHAR(opts.har);
     }
 
-    // Save session state (--session or --save-session)
+    // Save session
     const sessionSavePath = opts.saveSession ?? opts.session;
     if (sessionSavePath) {
       const state = await context.storageState();
@@ -340,25 +280,131 @@ export async function launchAndCapture(url: string, opts: BcurlOptions): Promise
       writeFileSync(opts.cookieJar, '# Netscape HTTP Cookie File\n' + cookieLines.join('\n') + '\n');
     }
 
-    await context.close();
-
     return {
-      url,
-      buffer,
+      url, buffer,
       format: format as 'png' | 'jpeg' | 'pdf',
       headers: responseHeaders,
       status: responseStatus,
       timing,
     };
   } finally {
+    await context.close();
+  }
+}
+
+/**
+ * Standalone mode: launch browser, capture, close browser.
+ */
+export async function launchAndCapture(url: string, opts: BcurlOptions): Promise<CaptureResult> {
+  const launchOpts: Parameters<typeof chromium.launch>[0] = { headless: true };
+
+  if (opts.proxy) {
+    const proxyUrl = opts.proxy.includes('://') ? opts.proxy : `http://${opts.proxy}`;
+    launchOpts.proxy = {
+      server: proxyUrl,
+      username: opts.proxyUser?.split(':')[0],
+      password: opts.proxyUser?.split(':').slice(1).join(':'),
+    };
+  }
+
+  const browser: Browser = await chromium.launch(launchOpts);
+  try {
+    return await captureWithContext(browser, url, opts);
+  } finally {
     await browser.close();
   }
 }
 
 /**
- * Parse a form field spec like 'input[placeholder*="Benutzername"]=admin'.
- * Finds the first '=' that is NOT inside [...] brackets or quotes.
+ * Parallel capture: one browser, multiple pages.
  */
+export async function* launchAndCaptureParallel(
+  urls: string[],
+  opts: BcurlOptions,
+  maxConcurrency: number = 4
+): AsyncGenerator<{ url: string; result?: CaptureResult; error?: string; index: number }> {
+  const launchOpts: Parameters<typeof chromium.launch>[0] = { headless: true };
+  if (opts.proxy) {
+    const proxyUrl = opts.proxy.includes('://') ? opts.proxy : `http://${opts.proxy}`;
+    launchOpts.proxy = {
+      server: proxyUrl,
+      username: opts.proxyUser?.split(':')[0],
+      password: opts.proxyUser?.split(':').slice(1).join(':'),
+    };
+  }
+
+  const browser = await chromium.launch(launchOpts);
+  try {
+    // Semaphore for concurrency limiting
+    let running = 0;
+    let resolveSlot: (() => void) | null = null;
+
+    async function acquireSlot(): Promise<void> {
+      while (running >= maxConcurrency) {
+        await new Promise<void>((resolve) => { resolveSlot = resolve; });
+      }
+      running++;
+    }
+
+    function releaseSlot(): void {
+      running--;
+      if (resolveSlot) {
+        const r = resolveSlot;
+        resolveSlot = null;
+        r();
+      }
+    }
+
+    type Result = { url: string; result?: CaptureResult; error?: string; index: number };
+    const results: Result[] = [];
+    let resolveNext: ((val: Result) => void) | null = null;
+    const pending: Result[] = [];
+
+    function pushResult(r: Result): void {
+      if (resolveNext) {
+        const rn = resolveNext;
+        resolveNext = null;
+        rn(r);
+      } else {
+        pending.push(r);
+      }
+    }
+
+    function waitForResult(): Promise<Result> {
+      if (pending.length > 0) return Promise.resolve(pending.shift()!);
+      return new Promise((resolve) => { resolveNext = resolve; });
+    }
+
+    // Launch all tasks
+    let completed = 0;
+    const total = urls.length;
+
+    const tasks = urls.map(async (url, index) => {
+      await acquireSlot();
+      try {
+        const result = await captureWithContext(browser, url, opts);
+        pushResult({ url, result, index });
+      } catch (err: any) {
+        pushResult({ url, error: err.message, index });
+      } finally {
+        releaseSlot();
+        completed++;
+      }
+    });
+
+    // Yield results as they arrive
+    for (let i = 0; i < total; i++) {
+      yield await waitForResult();
+    }
+
+    await Promise.all(tasks);
+  } finally {
+    await browser.close();
+  }
+}
+
+// --- Utility functions ---
+
 function parseFormField(field: string): { selector: string; value: string } {
   let bracketDepth = 0;
   let inDoubleQuote = false;
@@ -373,69 +419,46 @@ function parseFormField(field: string): { selector: string; value: string } {
     if (ch === '[' || ch === '(') { bracketDepth++; continue; }
     if (ch === ']' || ch === ')') { bracketDepth--; continue; }
     if (ch === '=' && bracketDepth === 0) {
-      return {
-        selector: field.substring(0, i),
-        value: field.substring(i + 1),
-      };
+      return { selector: field.substring(0, i), value: field.substring(i + 1) };
     }
   }
   throw new Error(`Invalid --form-field: "${field}". Expected format: CSS_SELECTOR=value`);
 }
 
-function parseCookieStrings(
-  cookieArgs: string[],
-  url: string
-): Array<{ name: string; value: string; url: string }> {
+function parseCookieStrings(cookieArgs: string[], url: string): Array<{ name: string; value: string; url: string }> {
   const cookies: Array<{ name: string; value: string; url: string }> = [];
 
   for (const arg of cookieArgs) {
-    // Could be a file path or inline cookies
     if (arg.includes('=') && !arg.startsWith('/') && !arg.startsWith('.')) {
-      // Inline cookie string: "name=value; name2=value2"
       const pairs = arg.split(';');
       for (const pair of pairs) {
         const trimmed = pair.trim();
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          cookies.push({
-            name: trimmed.substring(0, eqIdx).trim(),
-            value: trimmed.substring(eqIdx + 1).trim(),
-            url,
-          });
+          cookies.push({ name: trimmed.substring(0, eqIdx).trim(), value: trimmed.substring(eqIdx + 1).trim(), url });
         }
       }
     } else {
-      // Try to read as Netscape cookie file
       try {
         const content = readFileSync(arg, 'utf-8');
         for (const line of content.split('\n')) {
           if (line.startsWith('#') || !line.trim()) continue;
           const parts = line.split('\t');
           if (parts.length >= 7) {
-            cookies.push({
-              name: parts[5],
-              value: parts[6],
-              url,
-            });
+            cookies.push({ name: parts[5], value: parts[6], url });
           }
         }
       } catch {
-        // Treat as inline cookie
         const pairs = arg.split(';');
         for (const pair of pairs) {
           const trimmed = pair.trim();
           const eqIdx = trimmed.indexOf('=');
           if (eqIdx > 0) {
-            cookies.push({
-              name: trimmed.substring(0, eqIdx).trim(),
-              value: trimmed.substring(eqIdx + 1).trim(),
-              url,
-            });
+            cookies.push({ name: trimmed.substring(0, eqIdx).trim(), value: trimmed.substring(eqIdx + 1).trim(), url });
           }
         }
       }
     }
   }
-
   return cookies;
 }
