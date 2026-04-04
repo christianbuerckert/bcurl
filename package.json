@@ -1,0 +1,26 @@
+{
+  "name": "bcurl",
+  "version": "1.0.0",
+  "description": "Like curl, but returns a browser-rendered screenshot instead of source code",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "bcurl": "bin/bcurl.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "postinstall": "npx playwright install chromium"
+  },
+  "keywords": ["curl", "screenshot", "browser", "headless", "cli"],
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^13.1.0",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}

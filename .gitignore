@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Session/credential files (contain JWT tokens, cookies, auth state)
+*.session.json
+session.json
+*-session.json
+
+# Environment / secrets
+.env
+.env.*
+
+# Test output
+/tmp/
