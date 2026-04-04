@@ -160,11 +160,20 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'evaluate',
-    'Execute JavaScript in the page context and return the result.',
-    { code: z.string().describe('JavaScript code to execute') },
+    'Execute JavaScript in the page context and return the result. Supports top-level await (e.g. `await fetch(...)`). For multiple statements with await, use `return` to return the final value.',
+    { code: z.string().describe('JavaScript code to execute (supports top-level await)') },
     async ({ code }) => {
       const p = await ensurePage();
-      const result = await p.evaluate(code);
+      let wrappedCode = code;
+      if (code.includes('await')) {
+        const hasMultipleStatements = code.includes(';') || code.trim().includes('\n');
+        if (hasMultipleStatements) {
+          wrappedCode = `(async () => { ${code} })()`;
+        } else {
+          wrappedCode = `(async () => { return ${code} })()`;
+        }
+      }
+      const result = await p.evaluate(wrappedCode);
       return {
         content: [{
           type: 'text' as const,
@@ -260,6 +269,157 @@ export async function startMcpServer(): Promise<void> {
       }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }],
+      };
+    }
+  );
+
+  server.tool(
+    'upload',
+    'Upload a file to a file input element. Provide either a file path or base64-encoded content.',
+    {
+      selector: z.string().describe('CSS selector of the file input element'),
+      path: z.string().optional().describe('Absolute path to the file to upload'),
+      content: z.string().optional().describe('Base64-encoded file content (requires filename)'),
+      filename: z.string().optional().describe('Filename (required when using content)'),
+      mimeType: z.string().optional().describe('MIME type (default: application/octet-stream, only with content)'),
+    },
+    async ({ selector, path, content, filename, mimeType }) => {
+      const p = await ensurePage();
+      if (path) {
+        await p.setInputFiles(selector, path, { timeout: 10000 });
+      } else if (content && filename) {
+        const buffer = Buffer.from(content, 'base64');
+        await p.setInputFiles(selector, { name: filename, mimeType: mimeType ?? 'application/octet-stream', buffer }, { timeout: 10000 });
+      } else {
+        throw new Error('Either path or content+filename must be provided');
+      }
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }],
+      };
+    }
+  );
+
+  // ==================== CONVENIENCE TOOLS ====================
+
+  server.tool(
+    'login',
+    'Convenience tool: navigate to a login page, fill credentials, submit, and wait for navigation. Handles the full form-fill+click+wait flow in one call.',
+    {
+      url: z.string().describe('Login page URL'),
+      username: z.object({
+        selector: z.string().describe('CSS selector for username/email field'),
+        value: z.string().describe('Username/email value'),
+      }),
+      password: z.object({
+        selector: z.string().describe('CSS selector for password field'),
+        value: z.string().describe('Password value'),
+      }),
+      submit: z.string().optional().describe('CSS selector for submit button (default: auto-detect)'),
+      waitFor: z.string().optional().describe('CSS selector to wait for after login to confirm success'),
+    },
+    async ({ url, username, password, submit, waitFor }) => {
+      const p = await ensurePage();
+      const normalizedUrl = url.includes('://') ? url : `https://${url}`;
+      await p.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await p.waitForLoadState('networkidle').catch(() => {});
+
+      await p.fill(username.selector, username.value, { timeout: 10000 });
+      await p.fill(password.selector, password.value, { timeout: 10000 });
+
+      if (submit) {
+        await p.click(submit, { timeout: 10000 });
+      } else {
+        const commonSelectors = [
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button:text-is("Login")',
+          'button:text-is("Sign in")',
+          'button:text-is("Log in")',
+          'button:text-is("Anmelden")',
+        ];
+        let clicked = false;
+        for (const sel of commonSelectors) {
+          try {
+            await p.click(sel, { timeout: 2000 });
+            clicked = true;
+            break;
+          } catch { /* try next */ }
+        }
+        if (!clicked) await p.keyboard.press('Enter');
+      }
+
+      await p.waitForLoadState('networkidle').catch(() => {});
+      if (waitFor) await p.waitForSelector(waitFor, { timeout: 10000 });
+
+      const title = await p.title();
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ ok: true, url: p.url(), title }),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'assert',
+    'Assert that elements, text, URL, or title match expectations. Returns pass/fail for each check — ideal for QA verification.',
+    {
+      checks: z.array(z.object({
+        type: z.enum(['element', 'text', 'url', 'title']).describe('What to check'),
+        value: z.string().describe('Selector (element), substring (text), or pattern (url/title)'),
+        absent: z.boolean().optional().describe('Assert that it should NOT be present (default: false)'),
+      })).describe('List of assertions to check'),
+    },
+    async ({ checks }) => {
+      const p = await ensurePage();
+      const results = [];
+      let allPassed = true;
+
+      for (const check of checks) {
+        let passed = false;
+        let detail = '';
+
+        switch (check.type) {
+          case 'element': {
+            const el = await p.$(check.value);
+            const found = el !== null;
+            passed = check.absent ? !found : found;
+            detail = found ? 'found' : 'not found';
+            break;
+          }
+          case 'text': {
+            const bodyText = await p.evaluate(() => document.body.innerText);
+            const found = bodyText.includes(check.value);
+            passed = check.absent ? !found : found;
+            detail = found ? 'found in page' : 'not found in page';
+            break;
+          }
+          case 'url': {
+            const currentUrl = p.url();
+            const found = currentUrl.includes(check.value) || new RegExp(check.value).test(currentUrl);
+            passed = check.absent ? !found : found;
+            detail = `current: ${currentUrl}`;
+            break;
+          }
+          case 'title': {
+            const title = await p.title();
+            const found = title.includes(check.value) || new RegExp(check.value).test(title);
+            passed = check.absent ? !found : found;
+            detail = `current: ${title}`;
+            break;
+          }
+        }
+
+        if (!passed) allPassed = false;
+        results.push({ ...check, passed, detail });
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ passed: allPassed, total: checks.length, failed: results.filter(r => !r.passed).length, results }, null, 2),
+        }],
       };
     }
   );

@@ -7,12 +7,25 @@
   "bin": {
     "bcurl": "bin/bcurl.js"
   },
+  "files": [
+    "dist/",
+    "bin/",
+    "LICENSE",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/christianbuerckert/bcurl.git"
+  },
+  "homepage": "https://github.com/christianbuerckert/bcurl",
+  "author": "Christian Buerckert <christian@buerckert.eu>",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "prepublishOnly": "npm run build",
     "postinstall": "npx playwright install chromium"
   },
   "keywords": [
@@ -20,7 +33,11 @@
     "screenshot",
     "browser",
     "headless",
-    "cli"
+    "cli",
+    "playwright",
+    "mcp",
+    "scraping",
+    "visual-testing"
   ],
   "license": "MIT",
   "dependencies": {

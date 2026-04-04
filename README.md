@@ -25,7 +25,7 @@ bcurl --full-page --format pdf -o page.pdf https://example.com
 
 ## Use with Claude Code
 
-Register bcurl as an MCP server — gives Claude 20 browser tools (navigate, click, fill, screenshot, html, text, ...):
+Register bcurl as an MCP server — gives Claude 24 browser tools (navigate, click, fill, screenshot, login, assert, upload, ...):
 
 ```bash
 claude mcp add bcurl -- bcurl --mcp
@@ -163,7 +163,7 @@ bcurl exposes a [Model Context Protocol](https://modelcontextprotocol.io) server
 claude mcp add bcurl -- bcurl --mcp
 ```
 
-**20 tools** available — separated into navigation and output:
+**24 tools** available:
 
 **Navigation** (lightweight, returns status):
 `navigate`, `click`, `fill`, `select`, `hover`, `press`, `evaluate`, `wait_for`, `wait`, `back`, `forward`, `reload`, `scroll`
@@ -171,16 +171,29 @@ claude mcp add bcurl -- bcurl --mcp
 **Output** (explicit capture with params):
 `screenshot`, `html`, `text`, `pdf`, `network`
 
+**Convenience**:
+- `login` — full form-fill+click+wait login flow in one call, auto-detects submit button
+- `upload` — file upload via path or base64 content
+- `assert` — check element presence, text, URL, title with pass/fail results
+
 **Session**: `new_context`, `cookies`
+
+`evaluate` supports top-level `await` — use `await fetch(...)` directly instead of `.then()` chains.
 
 Example agent flow:
 ```
-navigate("https://app.example.com")     → { status: 200, title: "App" }
-fill("input[name=user]", "admin")       → { ok: true }
-click("button:text-is('Login')")        → { ok: true }
-text("h1")                              → "Dashboard"
+login({ url, username: {selector, value}, password: {selector, value} })
+                                        → { ok: true, url: "/dashboard", title: "Dashboard" }
 screenshot({ selector: ".stats" })      → [image]
-html({ selector: "table.data" })        → "<table>..."
+assert({ checks: [
+  { type: "element", value: ".stats" },
+  { type: "text", value: "Welcome" },
+  { type: "url", value: "/dashboard" }
+]})                                     → { passed: true, total: 3, failed: 0 }
+evaluate("await fetch('/api/data').then(r => r.json())")
+                                        → { users: [...] }
+upload({ selector: "input[type=file]", path: "/tmp/report.csv" })
+                                        → { ok: true }
 ```
 
 ## Installation
