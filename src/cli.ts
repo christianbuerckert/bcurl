@@ -10,8 +10,9 @@ import { loadConfig, isConfigDisabled, getExplicitConfig } from './config.js';
 import { isDaemonRunning, getDaemonStatus, stopDaemon, captureViaDaemon, spawnDaemon } from './daemon.js';
 import { handleDiff } from './diff.js';
 import { recordInteractions } from './record.js';
+import { startMcpServer } from './mcp.js';
 
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 
 function parseWindowSize(val: string): string {
   if (!/^\d+x\d+$/.test(val)) {
@@ -263,6 +264,11 @@ async function main(): Promise<void> {
 
   // Check for subcommands before parsing
   const subcommand = rawArgv[0];
+
+  if (subcommand === '--mcp' || subcommand === 'mcp') {
+    await startMcpServer();
+    return;
+  }
 
   if (subcommand === 'diff') {
     const diffArgs = rawArgv.slice(1);

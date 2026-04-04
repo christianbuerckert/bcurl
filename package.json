@@ -1,6 +1,6 @@
 {
   "name": "bcurl",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Like curl, but returns a browser-rendered screenshot instead of source code",
   "type": "module",
   "main": "dist/cli.js",
@@ -24,6 +24,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^13.1.0",
     "playwright": "^1.52.0"
   },

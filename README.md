@@ -144,6 +144,35 @@ header "Accept-Language: de-DE"
 
 Config is loaded from `/etc/bcurlrc`, `~/.bcurlrc`, `./.bcurlrc`. Override with `-K file`, disable with `-q`.
 
+### MCP Server (AI Agent Integration)
+
+bcurl exposes a [Model Context Protocol](https://modelcontextprotocol.io) server for AI agents to browse the web interactively:
+
+```bash
+# Register with Claude Code
+claude mcp add bcurl -- bcurl --mcp
+```
+
+**20 tools** available — separated into navigation and output:
+
+**Navigation** (lightweight, returns status):
+`navigate`, `click`, `fill`, `select`, `hover`, `press`, `evaluate`, `wait_for`, `wait`, `back`, `forward`, `reload`, `scroll`
+
+**Output** (explicit capture with params):
+`screenshot`, `html`, `text`, `pdf`, `network`
+
+**Session**: `new_context`, `cookies`
+
+Example agent flow:
+```
+navigate("https://app.example.com")     → { status: 200, title: "App" }
+fill("input[name=user]", "admin")       → { ok: true }
+click("button:text-is('Login')")        → { ok: true }
+text("h1")                              → "Dashboard"
+screenshot({ selector: ".stats" })      → [image]
+html({ selector: "table.data" })        → "<table>..."
+```
+
 ## Installation
 
 ### Requirements
