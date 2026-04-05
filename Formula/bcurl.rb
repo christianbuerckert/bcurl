@@ -1,8 +1,8 @@
 class Bcurl < Formula
   desc "Like curl, but returns a browser-rendered screenshot instead of source code"
   homepage "https://github.com/christianbuerckert/bcurl"
-  url "https://github.com/christianbuerckert/bcurl/archive/refs/tags/v2.0.0.tar.gz"
-  sha256 "664b76aae81049881366c441646b888caf7b1fcecf2f05a10c02f12287f84212"
+  url "https://github.com/christianbuerckert/bcurl/archive/refs/tags/v2.1.0.tar.gz"
+  sha256 "9c872708b64acc81c51fddfda3bd133d10969ea36cc6978acdd699aa48d27b5a"
   license "MIT"
 
   depends_on "node"
