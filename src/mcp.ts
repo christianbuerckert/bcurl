@@ -32,17 +32,42 @@ async function ensurePage(): Promise<Page> {
 async function applyViewport(
   p: Page,
   opts: { device?: string; windowSize?: string; darkMode?: boolean }
-): Promise<void> {
+): Promise<Page> {
   const device = opts.device ? DEVICES[opts.device] : undefined;
+
+  // Device emulation requires a new context for userAgent, isMobile, hasTouch, deviceScaleFactor
+  if (device) {
+    const b = await ensureBrowser();
+    const oldContext = p.context();
+    const context = await b.newContext({
+      viewport: device.viewport,
+      userAgent: device.userAgent,
+      deviceScaleFactor: device.deviceScaleFactor,
+      isMobile: device.isMobile,
+      hasTouch: device.hasTouch,
+      colorScheme: opts.darkMode ? 'dark' : undefined,
+    });
+    const newPage = await context.newPage();
+    // Transfer URL to new context
+    if (p.url() !== 'about:blank') {
+      await newPage.goto(p.url(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await newPage.waitForLoadState('networkidle').catch(() => {});
+    }
+    await oldContext.close();
+    page = newPage;
+    tracker = new NetworkTracker();
+    tracker.attach(newPage);
+    return newPage;
+  }
+
   if (opts.windowSize) {
     const [w, h] = opts.windowSize.split('x').map(Number);
     await p.setViewportSize({ width: w, height: h });
-  } else if (device) {
-    await p.setViewportSize(device.viewport);
   }
   if (opts.darkMode) {
     await p.emulateMedia({ colorScheme: 'dark' });
   }
+  return p;
 }
 
 async function hideElements(p: Page, selectors: string[]): Promise<void> {
@@ -58,7 +83,7 @@ async function hideElements(p: Page, selectors: string[]): Promise<void> {
 export async function startMcpServer(): Promise<void> {
   const server = new McpServer({
     name: 'bcurl',
-    version: '2.0.0',
+    version: '2.1.0',
   });
 
   // ==================== NAVIGATION TOOLS ====================
@@ -440,11 +465,11 @@ export async function startMcpServer(): Promise<void> {
       hide: z.array(z.string()).optional().describe('CSS selectors of elements to hide'),
     },
     async ({ format, quality, fullPage, selector, device, windowSize, darkMode, hide }) => {
-      const p = await ensurePage();
+      let p = await ensurePage();
       const fmt = format ?? 'png';
 
-      // Apply viewport changes
-      await applyViewport(p, { device, windowSize, darkMode });
+      // Apply viewport changes (may create new context for device emulation)
+      p = await applyViewport(p, { device, windowSize, darkMode });
 
       // Hide elements
       if (hide && hide.length > 0) await hideElements(p, hide);

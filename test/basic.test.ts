@@ -41,7 +41,7 @@ describe('bcurl basics', () => {
 
   it('shows version with --version', () => {
     const output = run(['--version']);
-    expect(output.trim()).toBe('2.0.0');
+    expect(output.trim()).toBe('2.1.0');
   });
 
   it('captures a screenshot to file', () => {

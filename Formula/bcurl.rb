@@ -9,6 +9,9 @@ class Bcurl < Formula
 
   def install
     system "npm", "install", *std_npm_args
+    cd "#{libexec}/lib/node_modules/bcurl" do
+      system "npm", "run", "build"
+    end
     bin.install_symlink Dir["#{libexec}/bin/*"]
   end
 
@@ -18,6 +21,6 @@ class Bcurl < Formula
   end
 
   test do
-    assert_match "2.0.0", shell_output("#{bin}/bcurl --version").strip
+    assert_match "2.1.0", shell_output("#{bin}/bcurl --version").strip
   end
 end
