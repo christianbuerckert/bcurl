@@ -8,10 +8,11 @@ class Bcurl < Formula
   depends_on "node"
 
   def install
+    # Build TypeScript (requires devDependencies for tsc)
+    system "npm", "install"
+    system "npx", "tsc"
+    # Install built package into libexec (production only)
     system "npm", "install", *std_npm_args
-    cd "#{libexec}/lib/node_modules/bcurl" do
-      system "npm", "run", "build"
-    end
     bin.install_symlink Dir["#{libexec}/bin/*"]
   end
 
