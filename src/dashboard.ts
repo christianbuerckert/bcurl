@@ -34,6 +34,7 @@ let server: https.Server | null = null;
 let serverPort = 0;
 let pending: PendingPrompt | null = null;
 let pageRef: Page | null = null;
+let dashboardVersion = '0.0.0';
 
 // Session cache: "credentialId.fieldName" → value (only for secret fields, never totp)
 const sessionCache = new Map<string, string>();
@@ -67,6 +68,10 @@ export function importSecrets(data: Record<string, string>): void {
 
 export function setPage(p: Page): void {
   pageRef = p;
+}
+
+export function setVersion(v: string): void {
+  dashboardVersion = v;
 }
 
 /** Log a tool call to the dashboard activity feed */
@@ -325,6 +330,7 @@ function startScreenshotLoop(): void {
 // ─── Dashboard HTML ───────────────────────────────────────────────
 
 function renderDashboard(): string {
+  const version = dashboardVersion;
   const initialLog = JSON.stringify(activityLog);
 
   return `<!DOCTYPE html>
@@ -443,7 +449,7 @@ function renderDashboard(): string {
 <body>
 
 <header>
-  <h1>bcurl</h1>
+  <h1>bcurl <span style="font-weight:400;font-size:0.75rem;color:#484f58">v${version}</span></h1>
   <div class="status">
     <span class="dot" id="statusDot"></span>
     <span id="statusText">Verbunden</span>

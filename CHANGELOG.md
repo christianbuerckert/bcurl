@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.3.0] - 2026-04-06
+
+### Added
+- **`query` tool** — DOM query shortcut: extract text and attributes from elements without writing JavaScript. Replaces most `evaluate` calls.
+- **`download` tool** — Download files using the browser session (cookies/auth). No more manual cookie extraction for PDFs, CSVs, etc.
+- **`scroll_and_collect` tool** — Scroll through virtualized lists/grids, collect items, and deduplicate. Ideal for lazy-loaded tables.
+- **`html({ compact: true })`** — Stripped-down HTML output: no scripts, styles, SVGs, comments, hidden elements. Returns only structural/interactive HTML (~100x smaller).
+- **Login form auto-detection** — `navigate` and `click` responses include detected login form fields with CSS selectors.
+
+### Changed
+- **Screenshot default** changed from PNG to JPEG quality 40 (~10x smaller context usage).
+- **`text` tool** promoted as preferred over screenshot in tool descriptions.
+- **`evaluate` tool** — Always wraps in async IIFE (no manual async/sync distinction), auto-returns single expressions, result always stringified (no more undefined/Promise errors), errors returned as JSON.
+
 ## [2.2.0] - 2026-04-06
 
 ### Added

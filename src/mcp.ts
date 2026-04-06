@@ -7,7 +7,7 @@ import { NetworkTracker } from './network.js';
 import { DEVICES } from './types.js';
 import {
   requestFields, getCachedSecret, listCachedIds, stopServer,
-  logActivity, setPage, ensureDashboard, isDashboardRunning, getDashboardUrl,
+  logActivity, setPage, setVersion, ensureDashboard, isDashboardRunning, getDashboardUrl,
   broadcast,
   type PromptField,
 } from './dashboard.js';
@@ -88,10 +88,13 @@ async function hideElements(p: Page, selectors: string[]): Promise<void> {
   }
 }
 
+const MCP_VERSION = '2.3.0';
+
 export async function startMcpServer(): Promise<void> {
+  setVersion(MCP_VERSION);
   const mcpServer = new McpServer({
     name: 'bcurl',
-    version: '2.2.0',
+    version: MCP_VERSION,
   });
 
   // Wrap server.tool to auto-log every tool call to the dashboard
