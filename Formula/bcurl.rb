@@ -1,8 +1,8 @@
 class Bcurl < Formula
   desc "Like curl, but returns a browser-rendered screenshot instead of source code"
   homepage "https://github.com/christianbuerckert/bcurl"
-  url "https://github.com/christianbuerckert/bcurl/archive/refs/tags/v2.1.0.tar.gz"
-  sha256 "9c872708b64acc81c51fddfda3bd133d10969ea36cc6978acdd699aa48d27b5a"
+  url "https://github.com/christianbuerckert/bcurl/archive/refs/tags/v2.3.0.tar.gz"
+  sha256 "dba96ccc4fc6cc0646955eeb87e01184df7f1ddac2f2f2b2e790ed215e8e9232"
   license "MIT"
 
   depends_on "node"
@@ -22,6 +22,6 @@ class Bcurl < Formula
   end
 
   test do
-    assert_match "2.1.0", shell_output("#{bin}/bcurl --version").strip
+    assert_match "2.3.0", shell_output("#{bin}/bcurl --version").strip
   end
 end
