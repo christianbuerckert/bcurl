@@ -315,25 +315,42 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'evaluate',
-    'Execute JavaScript in the page context and return the result. Supports top-level await (e.g. `await fetch(...)`). For multiple statements with await, use `return` to return the final value.',
-    { code: z.string().describe('JavaScript code to execute (supports top-level await)') },
+    'Execute JavaScript in the page context and return the result. ' +
+    'Automatically handles async/await — just write your code naturally. ' +
+    'Result is always returned as a string (JSON-stringified if needed). ' +
+    'Prefer specialized tools when possible: text (read content), html({compact:true}) (page structure), query (DOM queries), download (fetch files).',
+    { code: z.string().describe('JavaScript code to execute. Async/await is auto-detected and wrapped.') },
     async ({ code }) => {
       const p = await ensurePage();
-      let wrappedCode = code;
-      if (code.includes('await')) {
-        const hasMultipleStatements = code.includes(';') || code.trim().includes('\n');
-        if (hasMultipleStatements) {
-          wrappedCode = `(async () => { ${code} })()`;
-        } else {
-          wrappedCode = `(async () => { return ${code} })()`;
-        }
+      // Always wrap in async IIFE for consistent behavior
+      // Auto-return the last expression if no explicit return
+      const trimmed = code.trim();
+      const hasReturn = /\breturn\b/.test(trimmed);
+      const isMultiStatement = trimmed.includes(';') || trimmed.includes('\n');
+      let wrappedCode: string;
+      if (isMultiStatement || hasReturn) {
+        // Multi-statement: wrap as async IIFE, user must use return
+        wrappedCode = `(async () => { ${trimmed} })()`;
+      } else {
+        // Single expression: auto-return
+        wrappedCode = `(async () => { return (${trimmed}); })()`;
       }
-      const result = await p.evaluate(wrappedCode);
+      let result: unknown;
+      try {
+        result = await p.evaluate(wrappedCode);
+      } catch (err: any) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: err.message }) }],
+        };
+      }
+      // Always stringify — never return undefined or raw objects
+      const text = result === undefined || result === null
+        ? 'null'
+        : typeof result === 'string'
+        ? result
+        : JSON.stringify(result, null, 2);
       return {
-        content: [{
-          type: 'text' as const,
-          text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
-        }],
+        content: [{ type: 'text' as const, text }],
       };
     }
   );
@@ -450,6 +467,172 @@ export async function startMcpServer(): Promise<void> {
       }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }],
+      };
+    }
+  );
+
+  // ==================== QUERY & DOWNLOAD TOOLS ====================
+
+  server.tool(
+    'query',
+    'Query DOM elements and extract attributes or text. Much faster than evaluate for simple DOM lookups. ' +
+    'Returns an array of matches with text content and requested attributes.',
+    {
+      selector: z.string().describe('CSS selector to match elements'),
+      attributes: z.array(z.string()).optional().describe('Attributes to extract (e.g. ["href", "src", "data-id"]). Always includes textContent.'),
+      limit: z.number().optional().describe('Max number of results (default: 50)'),
+    },
+    async ({ selector, attributes, limit }) => {
+      const p = await ensurePage();
+      const maxResults = limit ?? 50;
+      const attrs = attributes ?? [];
+      const results = await p.evaluate(
+        ({ sel, attrs, max }: { sel: string; attrs: string[]; max: number }) => {
+          const els = document.querySelectorAll(sel);
+          const out: Record<string, string | null>[] = [];
+          for (let i = 0; i < Math.min(els.length, max); i++) {
+            const el = els[i] as HTMLElement;
+            const entry: Record<string, string | null> = {
+              text: el.innerText?.trim().substring(0, 200) || null,
+            };
+            for (const a of attrs) {
+              entry[a] = el.getAttribute(a);
+            }
+            out.push(entry);
+          }
+          return out;
+        },
+        { sel: selector, attrs, max: maxResults }
+      );
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ count: results.length, results }, null, 2),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'download',
+    'Download a file using the current browser session (cookies, auth). ' +
+    'Saves to the specified path. Uses the browser context so no cookie extraction needed.',
+    {
+      url: z.string().describe('URL to download'),
+      path: z.string().describe('Absolute file path to save to'),
+    },
+    async ({ url, path: filePath }) => {
+      const p = await ensurePage();
+      const normalizedUrl = url.includes('://') ? url : `https://${url}`;
+
+      // Use page context to fetch (inherits cookies/auth)
+      const result = await p.evaluate(async (fetchUrl: string) => {
+        const resp = await fetch(fetchUrl, { credentials: 'include' });
+        if (!resp.ok) return { error: `HTTP ${resp.status} ${resp.statusText}`, status: resp.status };
+        const buf = await resp.arrayBuffer();
+        // Convert to base64 to pass back to Node
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        return {
+          base64: btoa(binary),
+          contentType: resp.headers.get('content-type') || 'application/octet-stream',
+          size: buf.byteLength,
+          status: resp.status,
+        };
+      }, normalizedUrl);
+
+      if ('error' in result) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+        };
+      }
+
+      const buffer = Buffer.from(result.base64 as string, 'base64');
+      writeFileSync(filePath, buffer);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            ok: true,
+            path: filePath,
+            size: buffer.length,
+            contentType: result.contentType,
+          }),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'scroll_and_collect',
+    'Scroll through a container and collect text/attributes from repeated elements. ' +
+    'Ideal for virtualized lists/grids that only render visible rows. ' +
+    'Scrolls the container, collects matching elements after each scroll, and deduplicates.',
+    {
+      container: z.string().optional().describe('CSS selector of the scrollable container (default: window)'),
+      selector: z.string().describe('CSS selector of the items to collect'),
+      attributes: z.array(z.string()).optional().describe('Attributes to extract per item'),
+      scrollStep: z.number().optional().describe('Pixels to scroll per step (default: 500)'),
+      maxScrolls: z.number().optional().describe('Maximum scroll steps (default: 20)'),
+      pauseMs: z.number().optional().describe('Pause between scrolls in ms (default: 300)'),
+    },
+    async ({ container, selector, attributes, scrollStep, maxScrolls, pauseMs }) => {
+      const p = await ensurePage();
+      const step = scrollStep ?? 500;
+      const maxSteps = maxScrolls ?? 20;
+      const pause = pauseMs ?? 300;
+      const attrs = attributes ?? [];
+
+      const collected = new Map<string, Record<string, string | null>>();
+
+      for (let i = 0; i < maxSteps; i++) {
+        // Collect visible items
+        const items = await p.evaluate(
+          ({ sel, attrs }: { sel: string; attrs: string[] }) => {
+            const els = document.querySelectorAll(sel);
+            const out: Record<string, string | null>[] = [];
+            for (const el of els) {
+              const entry: Record<string, string | null> = {
+                text: (el as HTMLElement).innerText?.trim().substring(0, 500) || null,
+              };
+              for (const a of attrs) entry[a] = el.getAttribute(a);
+              out.push(entry);
+            }
+            return out;
+          },
+          { sel: selector, attrs }
+        );
+
+        // Deduplicate by text+attributes fingerprint
+        for (const item of items) {
+          const key = JSON.stringify(item);
+          if (!collected.has(key)) collected.set(key, item);
+        }
+
+        // Scroll
+        const scrolled = await p.evaluate(
+          ({ containerSel, pixels }: { containerSel: string | undefined; pixels: number }) => {
+            const el = containerSel ? document.querySelector(containerSel) : document.documentElement;
+            if (!el) return false;
+            const before = el.scrollTop;
+            el.scrollTop += pixels;
+            return el.scrollTop !== before; // false = reached bottom
+          },
+          { containerSel: container, pixels: step }
+        );
+
+        if (!scrolled) break; // reached end
+        await p.waitForTimeout(pause);
+      }
+
+      const results = [...collected.values()];
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ count: results.length, results }, null, 2),
+        }],
       };
     }
   );
