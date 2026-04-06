@@ -802,29 +802,109 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'html',
-    'Get HTML content of the current page or a specific element.',
+    'Get HTML content of the current page or a specific element. ' +
+    'Use compact: true to get a stripped-down version (no scripts, styles, SVGs, comments, data attributes) — ' +
+    'ideal for understanding page structure and finding selectors with minimal context usage.',
     {
       selector: z.string().optional().describe('CSS selector (default: entire page)'),
       outer: z.boolean().optional().describe('Return outerHTML instead of innerHTML (default: true)'),
+      compact: z.boolean().optional().describe('Strip scripts, styles, SVGs, comments, hidden elements, data-* attributes. Returns only structural/interactive HTML (default: false)'),
     },
-    async ({ selector, outer }) => {
+    async ({ selector, outer, compact }) => {
       const p = await ensurePage();
       const useOuter = outer ?? true;
+      const useCompact = compact ?? false;
 
       let html: string;
-      if (selector) {
-        html = await p.evaluate(
-          ({ sel, out }: { sel: string; out: boolean }) => {
-            const el = document.querySelector(sel);
-            if (!el) return `<!-- Element "${sel}" not found -->`;
-            return out ? el.outerHTML : el.innerHTML;
-          },
-          { sel: selector, out: useOuter }
-        );
+      if (useCompact) {
+        html = await p.evaluate(({ sel }: { sel: string | undefined }) => {
+          const root = sel ? document.querySelector(sel) : document.body;
+          if (!root) return `<!-- Element "${sel}" not found -->`;
+
+          const clone = root.cloneNode(true) as HTMLElement;
+
+          // Remove non-content elements
+          const removeSelectors = [
+            'script', 'style', 'link[rel="stylesheet"]', 'noscript',
+            'svg', 'iframe', 'video', 'audio', 'canvas', 'map',
+            'template', '[hidden]', '[aria-hidden="true"]',
+          ];
+          for (const sel of removeSelectors) {
+            clone.querySelectorAll(sel).forEach(el => el.remove());
+          }
+
+          // Remove elements hidden via inline style
+          clone.querySelectorAll('[style]').forEach(el => {
+            const s = (el as HTMLElement).style;
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
+              el.remove();
+            }
+          });
+
+          // Remove comments
+          const walker = document.createTreeWalker(clone, NodeFilter.SHOW_COMMENT);
+          const comments: Comment[] = [];
+          while (walker.nextNode()) comments.push(walker.currentNode as Comment);
+          comments.forEach(c => c.remove());
+
+          // Clean attributes: keep only meaningful ones
+          const keepAttrs = new Set([
+            'href', 'src', 'alt', 'title', 'name', 'id', 'class',
+            'type', 'value', 'placeholder', 'action', 'method',
+            'for', 'role', 'aria-label', 'aria-expanded', 'aria-selected',
+            'checked', 'disabled', 'readonly', 'selected', 'required',
+            'min', 'max', 'maxlength', 'pattern', 'target',
+          ]);
+          clone.querySelectorAll('*').forEach(el => {
+            const toRemove: string[] = [];
+            for (const attr of el.attributes) {
+              if (!keepAttrs.has(attr.name)) toRemove.push(attr.name);
+            }
+            toRemove.forEach(a => el.removeAttribute(a));
+          });
+
+          // Remove empty containers (divs/spans with no text and no interactive children)
+          const interactive = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'FORM', 'IMG']);
+          function pruneEmpty(el: Element): boolean {
+            // Prune children first (bottom-up)
+            for (const child of Array.from(el.children)) {
+              pruneEmpty(child);
+            }
+            // Keep interactive elements, elements with text, or meaningful tags
+            if (interactive.has(el.tagName)) return false;
+            if (['H1','H2','H3','H4','H5','H6','P','LI','TH','TD','LABEL','NAV','MAIN','HEADER','FOOTER','ARTICLE','SECTION'].includes(el.tagName)) return false;
+            // Remove if no text content and no interactive descendants
+            const hasText = el.textContent?.trim();
+            const hasInteractive = el.querySelector(Array.from(interactive).join(','));
+            if (!hasText && !hasInteractive) {
+              el.remove();
+              return true;
+            }
+            return false;
+          }
+          pruneEmpty(clone);
+
+          // Collapse whitespace in output
+          return clone.innerHTML
+            .replace(/\n\s*\n/g, '\n')
+            .replace(/^\s+$/gm, '')
+            .trim();
+        }, { sel: selector });
       } else {
-        html = await p.evaluate((out: boolean) => {
-          return out ? document.documentElement.outerHTML : document.body.innerHTML;
-        }, useOuter);
+        if (selector) {
+          html = await p.evaluate(
+            ({ sel, out }: { sel: string; out: boolean }) => {
+              const el = document.querySelector(sel);
+              if (!el) return `<!-- Element "${sel}" not found -->`;
+              return out ? el.outerHTML : el.innerHTML;
+            },
+            { sel: selector, out: useOuter }
+          );
+        } else {
+          html = await p.evaluate((out: boolean) => {
+            return out ? document.documentElement.outerHTML : document.body.innerHTML;
+          }, useOuter);
+        }
       }
 
       return {
