@@ -15,10 +15,44 @@ import {
 let browser: Browser | null = null;
 let page: Page | null = null;
 let tracker: NetworkTracker | null = null;
+let isHeadless = true;
 
-async function ensureBrowser(): Promise<Browser> {
+async function ensureBrowser(headless?: boolean): Promise<Browser> {
+  const wantHeadless = headless ?? isHeadless;
+  // Relaunch if headless mode changed
+  if (browser && browser.isConnected() && wantHeadless !== isHeadless) {
+    // Save state before closing
+    let storageState: any = undefined;
+    let currentUrl: string | undefined;
+    if (page && !page.isClosed()) {
+      try {
+        storageState = await page.context().storageState();
+        currentUrl = page.url();
+      } catch {}
+      await page.context().close().catch(() => {});
+    }
+    await browser.close().catch(() => {});
+    browser = null;
+    page = null;
+    isHeadless = wantHeadless;
+    browser = await chromium.launch({ headless: isHeadless });
+    // Restore state in new browser
+    if (storageState) {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, storageState });
+      page = await context.newPage();
+      tracker = new NetworkTracker();
+      tracker.attach(page);
+      setPage(page);
+      if (currentUrl && currentUrl !== 'about:blank') {
+        await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await page.waitForLoadState('networkidle').catch(() => {});
+      }
+    }
+    return browser;
+  }
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({ headless: true });
+    isHeadless = wantHeadless;
+    browser = await chromium.launch({ headless: isHeadless });
   }
   return browser;
 }
@@ -1171,7 +1205,10 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'new_context',
-    'Create a fresh browser context (clears cookies, localStorage, etc.). Optionally configure viewport and device emulation.',
+    'Create a fresh browser context (clears cookies, localStorage, etc.). ' +
+    'Use headed: true to open a visible browser window — useful when the user needs to interact directly ' +
+    '(e.g. solve CAPTCHAs, Cloudflare challenges). Use headed: false to switch back to headless. ' +
+    'When switching, cookies and session state are preserved automatically.',
     {
       device: z.string().optional().describe(`Device to emulate: ${Object.keys(DEVICES).join(', ')}`),
       windowSize: z.string().optional().describe('Viewport WxH (e.g. 1920x1080)'),
@@ -1179,8 +1216,14 @@ export async function startMcpServer(): Promise<void> {
       timezone: z.string().optional().describe('Timezone (e.g. Europe/Berlin)'),
       darkMode: z.boolean().optional().describe('Dark color scheme'),
       ignoreHTTPSErrors: z.boolean().optional().describe('Ignore SSL errors'),
+      headed: z.boolean().optional().describe('Open a visible browser window (default: false = headless). Use for CAPTCHAs or manual user interaction.'),
     },
-    async ({ device: deviceName, windowSize, locale, timezone, darkMode, ignoreHTTPSErrors }) => {
+    async ({ device: deviceName, windowSize, locale, timezone, darkMode, ignoreHTTPSErrors, headed }) => {
+      // Switch browser mode if needed (handles state transfer internally)
+      if (headed !== undefined) {
+        await ensureBrowser(!headed); // headed=true → headless=false
+      }
+
       // Close existing
       if (page && !page.isClosed()) {
         const ctx = page.context();
@@ -1217,6 +1260,7 @@ export async function startMcpServer(): Promise<void> {
             ok: true,
             viewport,
             device: deviceName ?? 'desktop',
+            headed: !isHeadless,
           }),
         }],
       };
