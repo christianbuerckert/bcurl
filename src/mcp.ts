@@ -750,10 +750,12 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'screenshot',
-    'Take a screenshot of the current page. Returns a base64-encoded image.',
+    'Take a screenshot of the current page. Returns a base64-encoded image. ' +
+    'EXPENSIVE: uses significant context. Prefer the text tool for reading page content. ' +
+    'Only use screenshot when you need to verify visual layout, check images, or debug rendering.',
     {
-      format: z.enum(['png', 'jpeg']).optional().describe('Image format (default: png)'),
-      quality: z.number().optional().describe('JPEG quality 0-100'),
+      format: z.enum(['png', 'jpeg']).optional().describe('Image format (default: jpeg)'),
+      quality: z.number().optional().describe('JPEG quality 0-100 (default: 40)'),
       fullPage: z.boolean().optional().describe('Capture full scrollable page'),
       selector: z.string().optional().describe('Capture only this CSS element'),
       device: z.string().optional().describe('Emulate device viewport before capture'),
@@ -763,7 +765,8 @@ export async function startMcpServer(): Promise<void> {
     },
     async ({ format, quality, fullPage, selector, device, windowSize, darkMode, hide }) => {
       let p = await ensurePage();
-      const fmt = format ?? 'png';
+      const fmt = format ?? 'jpeg';
+      const q = quality ?? 40;
 
       // Apply viewport changes (may create new context for device emulation)
       p = await applyViewport(p, { device, windowSize, darkMode });
@@ -777,12 +780,12 @@ export async function startMcpServer(): Promise<void> {
         if (!element) throw new Error(`Selector "${selector}" not found`);
         buffer = await element.screenshot({
           type: fmt,
-          quality: fmt === 'jpeg' ? (quality ?? 80) : undefined,
+          quality: fmt === 'jpeg' ? q : undefined,
         }) as Buffer;
       } else {
         buffer = await p.screenshot({
           type: fmt,
-          quality: fmt === 'jpeg' ? (quality ?? 80) : undefined,
+          quality: fmt === 'jpeg' ? q : undefined,
           fullPage: fullPage ?? false,
         }) as Buffer;
       }
@@ -832,7 +835,9 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'text',
-    'Get visible text content of the current page or a specific element.',
+    'Get visible text content of the current page or a specific element. ' +
+    'PREFERRED over screenshot for reading page content — much faster and uses far less context. ' +
+    'Use this for navigation decisions, reading data, checking results. Only use screenshot when you need to see visual layout.',
     {
       selector: z.string().optional().describe('CSS selector (default: body)'),
     },
