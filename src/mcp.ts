@@ -2,8 +2,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { chromium, type Browser, type Page } from 'playwright';
 import { z } from 'zod';
+import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { NetworkTracker } from './network.js';
 import { DEVICES } from './types.js';
+import {
+  requestFields, getCachedSecret, listCachedIds, stopServer,
+  logActivity, setPage, ensureDashboard, isDashboardRunning, getDashboardUrl,
+  broadcast,
+  type PromptField,
+} from './dashboard.js';
 
 let browser: Browser | null = null;
 let page: Page | null = null;
@@ -26,6 +33,7 @@ async function ensurePage(): Promise<Page> {
     tracker = new NetworkTracker();
     tracker.attach(page);
   }
+  setPage(page);
   return page;
 }
 
@@ -81,10 +89,130 @@ async function hideElements(p: Page, selectors: string[]): Promise<void> {
 }
 
 export async function startMcpServer(): Promise<void> {
-  const server = new McpServer({
+  const mcpServer = new McpServer({
     name: 'bcurl',
-    version: '2.1.0',
+    version: '2.2.0',
   });
+
+  // Wrap server.tool to auto-log every tool call to the dashboard
+  const originalTool = mcpServer.tool.bind(mcpServer);
+  const server = Object.assign(mcpServer, {
+    tool: (...toolArgs: any[]) => {
+      // server.tool(name, description, schema, handler) - handler is always last
+      const handler = toolArgs[toolArgs.length - 1] as Function;
+      const toolName = toolArgs[0] as string;
+      // Sensitive args that should be masked in the log
+      const sensitiveKeys = new Set(['value', 'password', 'code', 'content']);
+      toolArgs[toolArgs.length - 1] = (args: Record<string, unknown>) => {
+        if (isDashboardRunning()) {
+          const safeArgs: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(args ?? {})) {
+            safeArgs[k] = sensitiveKeys.has(k) ? '***' : v;
+          }
+          logActivity(toolName, Object.keys(safeArgs).length > 0 ? safeArgs : undefined);
+        }
+        return handler(args);
+      };
+      return (originalTool as Function)(...toolArgs);
+    },
+  });
+
+  // ─── Login form auto-detection ───────────────────────────────────
+
+  async function detectLoginForm(p: Page): Promise<null | {
+    fields: Array<{ name: string; label: string; selector: string; type: string; guessedRole: string }>;
+  }> {
+    return p.evaluate(() => {
+      const pwInputs = document.querySelectorAll<HTMLInputElement>(
+        'input[type="password"]:not([hidden]):not([style*="display:none"])'
+      );
+      if (pwInputs.length === 0) return null;
+
+      const fields: Array<{ name: string; label: string; selector: string; type: string; guessedRole: string }> = [];
+
+      // For each password field, find the associated username/email field
+      for (const pw of pwInputs) {
+        const form = pw.closest('form') ?? document.body;
+
+        // Find text/email inputs in the same form BEFORE the password field
+        const allInputs = Array.from(form.querySelectorAll<HTMLInputElement>(
+          'input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
+        )).filter(el => {
+          const style = getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+        });
+
+        // Pick the input closest before the password field in DOM order
+        const formInputs = Array.from(form.querySelectorAll('input'));
+        const pwIndex = formInputs.indexOf(pw);
+        const candidates = allInputs.filter(el => formInputs.indexOf(el) < pwIndex);
+        const userInput = candidates[candidates.length - 1]; // last one before password
+
+        if (userInput) {
+          const uid = userInput.id || userInput.name || userInput.placeholder || 'username';
+          const uType = userInput.type === 'email' ? 'email' : 'text';
+          const uSelector = userInput.id
+            ? `#${userInput.id}`
+            : userInput.name
+            ? `input[name="${userInput.name}"]`
+            : `input[placeholder="${userInput.placeholder}"]`;
+
+          fields.push({
+            name: 'username',
+            label: userInput.placeholder || userInput.getAttribute('aria-label') || 'Username / E-Mail',
+            selector: uSelector,
+            type: uType,
+            guessedRole: 'username',
+          });
+        }
+
+        const pwSelector = pw.id
+          ? `#${pw.id}`
+          : pw.name
+          ? `input[name="${pw.name}"]`
+          : 'input[type="password"]';
+
+        fields.push({
+          name: 'password',
+          label: pw.placeholder || pw.getAttribute('aria-label') || 'Passwort',
+          selector: pwSelector,
+          type: 'password',
+          guessedRole: 'password',
+        });
+      }
+
+      // Check for TOTP fields (usually 6-digit code inputs)
+      const otpInputs = document.querySelectorAll<HTMLInputElement>(
+        'input[autocomplete="one-time-code"], input[name*="otp"], input[name*="totp"], input[name*="2fa"], input[name*="mfa"], input[inputmode="numeric"][maxlength="6"]'
+      );
+      for (const otp of otpInputs) {
+        const otpSelector = otp.id ? `#${otp.id}` : otp.name ? `input[name="${otp.name}"]` : 'input[autocomplete="one-time-code"]';
+        fields.push({
+          name: 'totp',
+          label: otp.placeholder || '2FA Code',
+          selector: otpSelector,
+          type: 'totp',
+          guessedRole: 'totp',
+        });
+      }
+
+      return fields.length > 0 ? { fields } : null;
+    });
+  }
+
+  // Add login_form_detected hint to navigate/click responses
+  async function withLoginDetection(p: Page, result: Record<string, unknown>): Promise<Record<string, unknown>> {
+    try {
+      const detected = await detectLoginForm(p);
+      if (detected) {
+        if (isDashboardRunning()) {
+          broadcast({ type: 'login_detected', data: detected });
+        }
+        return { ...result, login_form_detected: detected };
+      }
+    } catch {}
+    return result;
+  }
 
   // ==================== NAVIGATION TOOLS ====================
 
@@ -98,14 +226,15 @@ export async function startMcpServer(): Promise<void> {
       const response = await p.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await p.waitForLoadState('networkidle').catch(() => {});
       const title = await p.title();
+      const result = await withLoginDetection(p, {
+        status: response?.status() ?? 0,
+        title,
+        url: p.url(),
+      });
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify({
-            status: response?.status() ?? 0,
-            title,
-            url: p.url(),
-          }),
+          text: JSON.stringify(result),
         }],
       };
     }
@@ -119,8 +248,9 @@ export async function startMcpServer(): Promise<void> {
       const p = await ensurePage();
       await p.click(selector, { timeout: 10000 });
       await p.waitForLoadState('networkidle').catch(() => {});
+      const result = await withLoginDetection(p, { ok: true, url: p.url() });
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, url: p.url() }) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
       };
     }
   );
@@ -449,6 +579,173 @@ export async function startMcpServer(): Promise<void> {
     }
   );
 
+  // ==================== DASHBOARD & SECRET TOOLS ====================
+
+  server.tool(
+    'dashboard',
+    'Open the live dashboard. Returns a URL the user can open to watch the browser in real-time ' +
+    'and provide input when needed (passwords, 2FA codes). The dashboard stays open for the session.',
+    {},
+    async () => {
+      await ensurePage(); // ensure page ref is set
+      const url = await ensureDashboard();
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ url, message: `Dashboard verfügbar: ${url}` }),
+        }],
+      };
+    }
+  );
+
+  // Pending fill promise — fill_form stores it, wait_for_secret awaits it
+  let pendingFill: Promise<string> | null = null;
+
+  server.tool(
+    'fill_form',
+    'Ask the user to provide form values (username, password, 2FA, etc.) via the live dashboard, then fill them into the page. ' +
+    'Supports multiple fields at once. Each field has a name, label, type, CSS selector, and a secret flag. ' +
+    'Non-secret fields (like username) are shown as plain text. Secret fields are masked. ' +
+    'Secret fields are cached by id for the session (except TOTP). ' +
+    'If all secret fields are cached, fills immediately without prompting. ' +
+    'Otherwise returns the dashboard URL — the user opens it and submits the form. Then call wait_for_secret.',
+    {
+      id: z.string().describe('Credential identifier (e.g. "github"). Used for session caching.'),
+      fields: z.array(z.object({
+        name: z.string().describe('Field key, e.g. "username", "password", "totp"'),
+        label: z.string().describe('Human-readable label shown to user, e.g. "GitHub Username"'),
+        selector: z.string().describe('CSS selector of the input field on the page'),
+        type: z.enum(['text', 'password', 'totp']).optional().describe('Input type (default: text)'),
+        secret: z.boolean().optional().describe('Is this a secret value? Secrets are masked and cached. Default: true for password/totp, false for text.'),
+        value: z.string().optional().describe('Value for non-secret fields (e.g. username/email). The agent can provide this directly. Secret fields MUST NOT have a value — they are entered by the user via the dashboard.'),
+      })).describe('Fields to fill. Non-secret fields like username can include a value directly. Secret fields are entered by the user. Example: [{name:"user", label:"Username", selector:"#login", type:"text", secret:false, value:"chris@example.com"}, {name:"pass", label:"Password", selector:"#password", type:"password"}]'),
+    },
+    async ({ id, fields }) => {
+      const p = await ensurePage();
+
+      // Normalize fields: default secret based on type
+      const normalized = fields.map(f => ({
+        ...f,
+        type: f.type ?? 'text' as const,
+        secret: f.secret ?? (f.type === 'password' || f.type === 'totp'),
+      }));
+
+      // Resolve known values: agent-provided values for non-secrets + cached secrets
+      const knownValues: Record<string, string> = {};
+      const needsInput: typeof normalized = []; // fields the user must fill via dashboard
+
+      for (const f of normalized) {
+        // Non-secret with value provided by agent → fill directly
+        if (!f.secret && f.value !== undefined) {
+          knownValues[f.name] = f.value;
+          continue;
+        }
+        // Secret (non-totp) that's cached → use cache
+        if (f.secret && f.type !== 'totp') {
+          const cached = getCachedSecret(id, f.name);
+          if (cached !== undefined) {
+            knownValues[f.name] = cached;
+            continue;
+          }
+        }
+        // Everything else needs user input via dashboard
+        needsInput.push(f);
+      }
+
+      // If nothing needs user input, fill everything immediately
+      if (needsInput.length === 0) {
+        for (const f of normalized) {
+          const val = knownValues[f.name];
+          if (val !== undefined) {
+            await p.fill(f.selector, val, { timeout: 10000 });
+          }
+        }
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, cached: true, filled: Object.keys(knownValues) }) }],
+        };
+      }
+
+      // Build prompt fields for dashboard
+      const promptFields: PromptField[] = needsInput
+        .map(f => ({ name: f.name, label: f.label, type: f.type as 'text' | 'password' | 'totp', secret: f.secret }));
+
+      const { dashboardUrl, promise } = await requestFields(p, id, promptFields);
+
+      // Store fill promise
+      pendingFill = (async () => {
+        const userValues = await promise;
+        // Merge all values, then fill every field
+        const allValues = { ...knownValues, ...userValues };
+        for (const f of normalized) {
+          const val = allValues[f.name];
+          if (val !== undefined) {
+            await p.fill(f.selector, val, { timeout: 10000 });
+          }
+        }
+        return JSON.stringify({ ok: true, filled: Object.keys(allValues) });
+      })();
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            action: 'waiting_for_user',
+            dashboard: dashboardUrl,
+            message: `Bitte Dashboard öffnen und Eingaben machen: ${dashboardUrl}`,
+            fields_requested: promptFields.map(f => f.name),
+          }),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'wait_for_secret',
+    'Wait for the user to submit values via the dashboard. Call this after fill_form returned a dashboard URL. Blocks until the user has submitted and all fields are filled.',
+    {
+      timeout: z.number().optional().describe('Timeout in ms (default: 120000 = 2 minutes)'),
+    },
+    async ({ timeout }) => {
+      const timeoutMs = timeout ?? 120000;
+      if (!pendingFill) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, message: 'No pending request' }) }],
+        };
+      }
+      try {
+        const result = await Promise.race([
+          pendingFill,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Timeout waiting for user input')), timeoutMs)
+          ),
+        ]);
+        pendingFill = null;
+        return {
+          content: [{ type: 'text' as const, text: result }],
+        };
+      } catch (err: any) {
+        pendingFill = null;
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: err.message }) }],
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'list_secrets',
+    'List secret IDs that are cached in the current session. Returns only IDs, never values.',
+    {},
+    async () => {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ cached: listCachedIds() }),
+        }],
+      };
+    }
+  );
+
   // ==================== OUTPUT TOOLS ====================
 
   server.tool(
@@ -694,6 +991,97 @@ export async function startMcpServer(): Promise<void> {
     }
   );
 
+  server.tool(
+    'save_session',
+    'Save the current browser session (cookies, localStorage) to a file. ' +
+    'Can be restored later with load_session, even across bcurl restarts. ' +
+    'Does NOT save secrets — those stay only in memory.',
+    {
+      path: z.string().describe('File path to save session to (e.g. ~/.bcurl/sessions/github.json)'),
+    },
+    async ({ path: filePath }) => {
+      const p = await ensurePage();
+      const browserState = await p.context().storageState();
+
+      const session = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        url: p.url(),
+        browserState,
+      };
+
+      writeFileSync(filePath, JSON.stringify(session, null, 2), { mode: 0o600 });
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            ok: true,
+            path: filePath,
+            cookies: browserState.cookies.length,
+            origins: browserState.origins.length,
+          }),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'load_session',
+    'Restore a previously saved browser session (cookies, localStorage) from a file. ' +
+    'Creates a new browser context with the saved state. Secrets are NOT restored — they must be re-entered.',
+    {
+      path: z.string().describe('File path to load session from'),
+      navigate: z.boolean().optional().describe('Navigate to the URL that was active when saved (default: false)'),
+    },
+    async ({ path: filePath, navigate: nav }) => {
+      if (!existsSync(filePath)) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: 'File not found: ' + filePath }) }],
+        };
+      }
+
+      const raw = readFileSync(filePath, 'utf8');
+      const session = JSON.parse(raw);
+
+      // Close existing context
+      if (page && !page.isClosed()) {
+        const ctx = page.context();
+        await page.close();
+        await ctx.close();
+      }
+
+      const b = await ensureBrowser();
+      const context = await b.newContext({
+        viewport: { width: 1280, height: 720 },
+        storageState: session.browserState,
+      });
+      page = await context.newPage();
+      tracker = new NetworkTracker();
+      tracker.attach(page);
+      setPage(page);
+
+      // Optionally navigate to saved URL
+      if (nav && session.url && session.url !== 'about:blank') {
+        await page.goto(session.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForLoadState('networkidle').catch(() => {});
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            ok: true,
+            savedAt: session.savedAt,
+            url: session.url,
+            cookies: session.browserState?.cookies?.length ?? 0,
+            navigated: nav ?? false,
+          }),
+        }],
+      };
+    }
+  );
+
   // ==================== START ====================
 
   const transport = new StdioServerTransport();
@@ -701,11 +1089,13 @@ export async function startMcpServer(): Promise<void> {
 
   // Cleanup on exit
   process.on('SIGTERM', async () => {
+    stopServer();
     if (page && !page.isClosed()) await page.context().close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     process.exit(0);
   });
   process.on('SIGINT', async () => {
+    stopServer();
     if (page && !page.isClosed()) await page.context().close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     process.exit(0);
