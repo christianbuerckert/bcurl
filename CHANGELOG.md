@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.4.0] - 2026-04-07
+
+### Added
+- **`screenshot({ savePath })`** — Save screenshots directly to a file instead of returning base64. Much cheaper on context when visual inspection by the agent is not needed.
+
 ## [2.3.0] - 2026-04-06
 
 ### Added

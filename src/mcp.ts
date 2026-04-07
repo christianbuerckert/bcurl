@@ -2,7 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { chromium, type Browser, type Page } from 'playwright';
 import { z } from 'zod';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { resolve, dirname } from 'path';
 import { NetworkTracker } from './network.js';
 import { DEVICES } from './types.js';
 import {
@@ -122,7 +123,7 @@ async function hideElements(p: Page, selectors: string[]): Promise<void> {
   }
 }
 
-const MCP_VERSION = '2.3.0';
+const MCP_VERSION = '2.4.0';
 
 export async function startMcpServer(): Promise<void> {
   setVersion(MCP_VERSION);
@@ -970,9 +971,10 @@ export async function startMcpServer(): Promise<void> {
 
   server.tool(
     'screenshot',
-    'Take a screenshot of the current page. Returns a base64-encoded image. ' +
-    'EXPENSIVE: uses significant context. Prefer the text tool for reading page content. ' +
-    'Only use screenshot when you need to verify visual layout, check images, or debug rendering.',
+    'Take a screenshot of the current page. Returns a base64-encoded image or saves to a file. ' +
+    'EXPENSIVE when returned as base64: uses significant context. Prefer the text tool for reading page content. ' +
+    'Only use screenshot when you need to verify visual layout, check images, or debug rendering. ' +
+    'Use savePath to save to a file instead of returning base64 — this is much cheaper on context.',
     {
       format: z.enum(['png', 'jpeg']).optional().describe('Image format (default: jpeg)'),
       quality: z.number().optional().describe('JPEG quality 0-100 (default: 40)'),
@@ -982,8 +984,9 @@ export async function startMcpServer(): Promise<void> {
       windowSize: z.string().optional().describe('Viewport WxH (e.g. 1920x1080)'),
       darkMode: z.boolean().optional().describe('Emulate dark mode'),
       hide: z.array(z.string()).optional().describe('CSS selectors of elements to hide'),
+      savePath: z.string().optional().describe('Save screenshot to this file path instead of returning base64'),
     },
-    async ({ format, quality, fullPage, selector, device, windowSize, darkMode, hide }) => {
+    async ({ format, quality, fullPage, selector, device, windowSize, darkMode, hide, savePath }) => {
       let p = await ensurePage();
       const fmt = format ?? 'jpeg';
       const q = quality ?? 40;
@@ -1008,6 +1011,15 @@ export async function startMcpServer(): Promise<void> {
           quality: fmt === 'jpeg' ? q : undefined,
           fullPage: fullPage ?? false,
         }) as Buffer;
+      }
+
+      if (savePath) {
+        const resolved = resolve(savePath);
+        mkdirSync(dirname(resolved), { recursive: true });
+        writeFileSync(resolved, buffer);
+        return {
+          content: [{ type: 'text' as const, text: `Screenshot saved to ${resolved}` }],
+        };
       }
 
       return {
