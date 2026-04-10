@@ -1,7 +1,8 @@
 import http from 'http';
 import https from 'https';
+import crypto from 'crypto';
 import { execSync } from 'child_process';
-import { mkdirSync, existsSync, readFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { Page } from 'playwright';
@@ -149,13 +150,24 @@ function ensureTlsCerts(): { key: string; cert: string } {
   const certPath = join(tlsDir, 'cert.pem');
 
   if (existsSync(keyPath) && existsSync(certPath)) {
-    return { key: readFileSync(keyPath, 'utf8'), cert: readFileSync(certPath, 'utf8') };
+    // Validate that Node.js can actually parse the key (catches LibreSSL/OpenSSL incompatibility)
+    try {
+      const key = readFileSync(keyPath, 'utf8');
+      const cert = readFileSync(certPath, 'utf8');
+      crypto.createPrivateKey(key);
+      return { key, cert };
+    } catch {
+      // Cert/key invalid — delete and regenerate
+      try { unlinkSync(keyPath); } catch {}
+      try { unlinkSync(certPath); } catch {}
+    }
   }
 
   mkdirSync(tlsDir, { recursive: true });
 
+  // Use RSA (universally compatible across LibreSSL/OpenSSL/Node.js)
   execSync(
-    `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
+    `openssl req -x509 -newkey rsa:2048 ` +
     `-keyout "${keyPath}" -out "${certPath}" -days 3650 -nodes ` +
     `-subj "/CN=bcurl-dashboard/O=bcurl" ` +
     `-addext "subjectAltName=IP:127.0.0.1"`,
